@@ -1,0 +1,11 @@
+#ROS2 build files
+log/
+build/
+install/
+__pycache__/
+
+# Unity Simulation
+*/lib/simulation/
+
+# VsCode settings
+.vscode/

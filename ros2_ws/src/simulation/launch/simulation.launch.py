@@ -101,6 +101,7 @@ def generate_launch_description():
         executable="controller_node",
         name="controller_node",
         output="screen",
+        remappings=[('/current_state', '/current_state_est')] #remap controllers input to /current_state_est
     )
 
     # Static TF publishers (ROS2 CLI style args; verify for your ROS2 distro)
