@@ -25,7 +25,7 @@ def generate_launch_description():
     # Declare args
     declared_args = [
         DeclareLaunchArgument("load_params", default_value="true"),
-        DeclareLaunchArgument("corrupt_state_estimate", default_value="true"),
+        DeclareLaunchArgument("corrupt_state_estimate", default_value="false"),
         DeclareLaunchArgument("right_image_topic", default_value="/realsense/rgb/right_image_raw"),
         DeclareLaunchArgument("right_info_topic", default_value="/realsense/rgb/right_image_info"),
         DeclareLaunchArgument("left_image_topic", default_value="/realsense/rgb/left_image_raw"),
