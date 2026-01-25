@@ -96,12 +96,19 @@ def generate_launch_description():
         output="screen",
     )
 
+    unity_state = Node(
+        package="simulation",
+        executable="unity_state",
+        name="unity_state",
+        output="screen",
+    )
+
     controller_node = Node(
         package="controller_pkg",
         executable="controller_node",
         name="controller_node",
         output="screen",
-        remappings=[('/current_state', '/current_state_est')] #remap controllers input to /current_state_est
+        remappings=[('/current_state', '/current_state')] #remap controllers input to /current_state_est
     )
 
     # Static TF publishers (ROS2 CLI style args; verify for your ROS2 distro)
@@ -158,6 +165,7 @@ def generate_launch_description():
             state_estimate_corruptor,
             state_estimate_corruptor_disabled,
             w_to_unity,
+            unity_state,
             controller_node,
             *static_tf_nodes,
         ]
