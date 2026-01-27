@@ -58,7 +58,7 @@ BasicPlanner::BasicPlanner(const rclcpp::Node::SharedPtr & node)
   // Subscriber for Odometry
   sub_odom_ =
     node_->create_subscription<nav_msgs::msg::Odometry>(
-      "current_state_est", 10,
+      "current_state", 10,
       std::bind(&BasicPlanner::uavOdomCallback, this, std::placeholders::_1));
 }
 
@@ -70,6 +70,11 @@ void BasicPlanner::uavOdomCallback(const nav_msgs::msg::Odometry::SharedPtr odom
 
   // store current velocity
   tf2::fromMsg(odom->twist.twist.linear, current_velocity_);
+  
+  if(!initialized_) {
+      RCLCPP_INFO(node_->get_logger(), "Planner Initialized: Got first Odometry message.");
+      initialized_ = true;
+  }
 }
 
 // Method to set maximum speed.

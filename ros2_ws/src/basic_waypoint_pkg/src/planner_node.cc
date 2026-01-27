@@ -24,21 +24,18 @@
    // Instantiate basic planner
    BasicPlanner planner(node);
  
-   // Let things settle a bit (similar to ros::Duration(1.0).sleep())
-   rclcpp::Rate init_rate(10.0);
-   init_rate.sleep();
+   // Wait for initialization (odometry)
+   rclcpp::Rate loop_rate(10.0);
+   while(rclcpp::ok() && !planner.isInitialized()) {
+       rclcpp::spin_some(node);
+       RCLCPP_INFO_THROTTLE(node->get_logger(), *node->get_clock(), 1000, "Waiting for Odometry...");
+       loop_rate.sleep();
+   }
  
    // Define goal point
    Eigen::Vector3d goal_position, goal_velocity;
    goal_position << -340.0, 9.0, 16.0; //12.0, 39.0, 9.0
    goal_velocity << 0.0, 0.0, 0.0;
- 
-   // Process some callbacks so that the odom callback can run
-   rclcpp::Rate spin_rate(50.0);
-   for (int i = 0; i < 10; ++i) {
-     rclcpp::spin_some(node);
-     spin_rate.sleep();
-   }
  
    // Plan and publish trajectory
    mav_trajectory_generation::Trajectory trajectory;
