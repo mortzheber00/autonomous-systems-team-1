@@ -11,6 +11,9 @@ find_package(rclcpp REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(mav_msgs REQUIRED)
+find_package(octomap_msgs REQUIRED)
+find_package(octomap REQUIRED)
+find_package(tf2 REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -23,5 +26,21 @@ if(BUILD_TESTING)
   set(ament_cmake_cpplint_FOUND TRUE)
   ament_lint_auto_find_test_dependencies()
 endif()
+
+# Add local planner node executable
+add_executable(local_planner_node src/local_planner_node.cpp)
+ament_target_dependencies(local_planner_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  octomap_msgs
+  octomap
+  tf2
+)
+
+# Install executable
+install(TARGETS local_planner_node
+  DESTINATION lib/${PROJECT_NAME}
+)
 
 ament_package()
