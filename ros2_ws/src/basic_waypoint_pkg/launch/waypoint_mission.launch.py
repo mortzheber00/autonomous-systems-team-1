@@ -28,7 +28,7 @@ def generate_launch_description():
         executable="basic_waypoint_node",   # ROS1: type="basic_waypoint_pkg"
         name="planner",
         output="screen",
-        parameters=[trajectory_config]
+        parameters=[trajectory_config, {"use_sim_time": True}]
     )
 
     # Trajectory sampler node
@@ -37,6 +37,7 @@ def generate_launch_description():
         executable="trajectory_sampler_node",
         name="sampler",
         output="screen",
+        parameters=[{"use_sim_time": True}],
         remappings=[
             ("path_segments_4D", "trajectory"),
         ],
