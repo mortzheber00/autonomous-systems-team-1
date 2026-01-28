@@ -17,24 +17,35 @@ class KeyboardControlNode(Node):
     def __init__(self):
         super().__init__('keyboard_control_node')
         
-        # Initialize current state
-        self.current_pose = Point(x=0.0, y=0.0, z=1.0)
+        # Current state (continuously updated from odometry)
+        self.current_pose = Point(x=-38.0, y=10.0, z=9.0)
         self.current_heading = 0.0
+        
+        # Desired state (internal counter, only updated on valid key presses)
+        self.desired_pose = Point(x=-38.0, y=10.0, z=9.0)
+        self.desired_heading = 0.0
+        
+        # Flag to track if initial position has been read
+        self.initial_pose_set = False
+        
+        # Threshold: only accept new inputs if drone is within this distance
+        self.proximity_threshold = 1.5  # meters
         
         # Create publisher and subscriber
         self.trajectory_pub = self.create_publisher(
-            MultiDOFJointTrajectory,
-            '/command/trajectory',
+            MultiDOFJointTrajectoryPoint,
+            '/desired_state',
             10
         )
         self.pose_sub = self.create_subscription(
             Odometry,
-            '/current_state_est',
+            '/current_state',
             self.pose_callback,
             10
         )
         
         self.get_logger().info('Keyboard control node initialized')
+        self.get_logger().info('Waiting for initial odometry...')
 
     # --- Math Helper Functions (Replacements for tf.transformations) ---
     def get_yaw_from_quaternion(self, q: Quaternion) -> float:
@@ -61,7 +72,21 @@ class KeyboardControlNode(Node):
     def pose_callback(self, msg: Odometry):
         self.current_pose = msg.pose.pose.position
         self.current_heading = self.get_yaw_from_quaternion(msg.pose.pose.orientation)
-
+        
+        # Set initial desired state only once
+        if not self.initial_pose_set:
+            self.desired_pose = Point(
+                x=self.current_pose.x,
+                y=self.current_pose.y,
+                z=self.current_pose.z
+            )
+            self.desired_heading = self.current_heading
+            self.initial_pose_set = True
+            self.get_logger().info(
+                f'Initial position set: [{self.desired_pose.x:.2f}, '
+                f'{self.desired_pose.y:.2f}, {self.desired_pose.z:.2f}]'
+            )
+    
     def get_key(self):
         settings = termios.tcgetattr(sys.stdin)
         try:
@@ -76,31 +101,36 @@ class KeyboardControlNode(Node):
             termios.tcsetattr(sys.stdin, termios.TCSADRAIN, settings)
         return key
     
-    def key_to_trajectory(self, key: str) -> MultiDOFJointTrajectory:
-        step_size = 3.0
+    def distance_to_desired(self) -> float:
+        """Calculate Euclidean distance from current pose to desired pose."""
+        dx = self.current_pose.x - self.desired_pose.x
+        dy = self.current_pose.y - self.desired_pose.y
+        dz = self.current_pose.z - self.desired_pose.z
+        return math.sqrt(dx*dx + dy*dy + dz*dz)
+    
+    def key_to_trajectory(self, key: str) -> MultiDOFJointTrajectoryPoint:
+        step_size = 1.0
         rotation_step_size = 0.1
-        pose = [self.current_pose.x, self.current_pose.y, self.current_pose.z]
-        desired_yaw = self.current_heading
-
-        trajectory = MultiDOFJointTrajectory()
-        trajectory.header.stamp = self.get_clock().now().to_msg()
-        trajectory.header.frame_id = "world"
+        
+        # Work with internal desired state (not current_pose!)
+        pose = [self.desired_pose.x, self.desired_pose.y, self.desired_pose.z]
+        desired_yaw = self.desired_heading
 
         point = MultiDOFJointTrajectoryPoint()
         transform = Transform()
 
         if key == "w":
-            pose[0] += step_size * cos(self.current_heading)
-            pose[1] += step_size * sin(self.current_heading)
+            pose[0] += step_size * cos(self.desired_heading)
+            pose[1] += step_size * sin(self.desired_heading)
         elif key == "s":
-            pose[0] -= step_size * cos(self.current_heading)
-            pose[1] -= step_size * sin(self.current_heading)
+            pose[0] -= step_size * cos(self.desired_heading)
+            pose[1] -= step_size * sin(self.desired_heading)
         elif key == "a":
-            pose[0] -= step_size * sin(self.current_heading)
-            pose[1] += step_size * cos(self.current_heading)
+            pose[0] -= step_size * sin(self.desired_heading)
+            pose[1] += step_size * cos(self.desired_heading)
         elif key == "d":
-            pose[0] += step_size * sin(self.current_heading)
-            pose[1] -= step_size * cos(self.current_heading)
+            pose[0] += step_size * sin(self.desired_heading)
+            pose[1] -= step_size * cos(self.desired_heading)
         elif key == "q":
             pose[2] += step_size
         elif key == "e":
@@ -109,6 +139,12 @@ class KeyboardControlNode(Node):
             desired_yaw += rotation_step_size
         elif key == "l":
             desired_yaw -= rotation_step_size
+
+        # Update internal desired state
+        self.desired_pose.x = pose[0]
+        self.desired_pose.y = pose[1]
+        self.desired_pose.z = pose[2]
+        self.desired_heading = desired_yaw
 
         transform.translation.x = pose[0]
         transform.translation.y = pose[1]
@@ -120,8 +156,7 @@ class KeyboardControlNode(Node):
         point.transforms = [transform]
         point.velocities = [Twist()]
         point.accelerations = [Twist()]
-        trajectory.points.append(point)
-        return trajectory
+        return point
 
     def run(self):
         print("\nKeyboard Control:")
@@ -134,19 +169,38 @@ class KeyboardControlNode(Node):
         
         try:
             while rclpy.ok():
-                # 1. Read key (non-blocking-ish due to select timeout)
+                # Process ROS callbacks to update current_pose
+                rclpy.spin_once(self, timeout_sec=0.01)
+                
+                # Wait for initial position to be set
+                if not self.initial_pose_set:
+                    continue
+                
+                # Read key (non-blocking)
                 key = self.get_key()
                 
                 if key == 'p':
                     self.get_logger().info('Quitting...')
                     break
                 elif key and key in 'wsadqejl':
+                    # Check if drone is close enough to desired position
+                    dist = self.distance_to_desired()
+                    
+                    if dist > self.proximity_threshold:
+                        self.get_logger().warn(
+                            f'Drone too far from target ({dist:.2f}m > {self.proximity_threshold}m). '
+                            f'Wait for drone to reach waypoint first!'
+                        )
+                        continue
+                    
+                    # Generate and publish new trajectory
                     trajectory = self.key_to_trajectory(key)
                     self.trajectory_pub.publish(trajectory)
-                    self.get_logger().info(f'Published trajectory for key: {key}')
-                
-                # 2. Process ROS callbacks (like odometry)
-                rclpy.spin_once(self, timeout_sec=0.01)
+                    self.get_logger().info(
+                        f'Key: {key} -> New target: [{self.desired_pose.x:.2f}, '
+                        f'{self.desired_pose.y:.2f}, {self.desired_pose.z:.2f}] '
+                        f'(current dist: {dist:.2f}m)'
+                    )
                 
         except KeyboardInterrupt:
             pass
