@@ -29,7 +29,7 @@ class KeyboardControlNode(Node):
         )
         self.pose_sub = self.create_subscription(
             Odometry,
-            '/current_state_est',
+            '/current_state',
             self.pose_callback,
             10
         )
