@@ -57,8 +57,9 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
 
   // Configuration
-  const float exploration_radius_ = 1.0;    // Radius around frontier to calculate gain
+  const float exploration_radius_ = 5.0;    // Radius around frontier to calculate gain
   const float occupied_threshold_ = 0.5;    // Occupancy probability threshold
+  const float search_radius_ = 20.0;        // Optimization: Search radius increased for larger caves (20m diam)
 
   // Store latest drone pose and orientation
   geometry_msgs::msg::Point last_drone_position_;
@@ -143,9 +144,9 @@ private:
     marker.pose.position.y = goal_msg.y;
     marker.pose.position.z = goal_msg.z;
     marker.pose.orientation.w = 1.0;
-    marker.scale.x = 10.0;
-    marker.scale.y = 10.0;
-    marker.scale.z = 10.0;
+    marker.scale.x = 5.0;
+    marker.scale.y = 5.0;
+    marker.scale.z = 5.0;
     marker.color.a = 1.0;
     marker.color.r = 0.0;
     marker.color.g = 1.0;
@@ -169,8 +170,14 @@ private:
   std::vector<octomap::point3d> get_frontier_points(octomap::OcTree* octree)
   {
     std::vector<octomap::point3d> frontiers;
+    octomap::point3d drone_position(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
     
     for (auto leaf = octree->begin_leafs(); leaf != octree->end_leafs(); ++leaf) {
+      // Optimization: Bounding box check first (fastest) - skip far away points
+      if (leaf.getCoordinate().distance(drone_position) > search_radius_) {
+        continue;
+      }
+
       // Only consider free cells
       if (leaf->getOccupancy() < occupied_threshold_) {
         double size = octree->getNodeSize(leaf.getDepth());
@@ -184,6 +191,8 @@ private:
         };
         
         bool is_frontier = false;
+        bool is_safe = true; // Optimization: Safety check
+
         for (auto& dir : directions) {
           octomap::point3d neighbor_point = 
             leaf_coordinate + octomap::point3d(dir[0], dir[1], dir[2]);
@@ -192,11 +201,14 @@ private:
           // If neighbor doesn't exist in tree, it's unknown → this is a frontier
           if (!neighbor_node) {
             is_frontier = true;
-            break;
+          } else if (neighbor_node->getOccupancy() > occupied_threshold_) {
+             // Neighbor is an obstacle -> unsafe
+             is_safe = false;
+             break;
           }
         }
         
-        if (is_frontier) {
+        if (is_frontier && is_safe) {
           frontiers.push_back(leaf_coordinate);
         }
       }

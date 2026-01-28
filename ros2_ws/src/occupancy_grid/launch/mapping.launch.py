@@ -29,7 +29,7 @@ def generate_launch_description():
         output='screen',
         parameters=[{
             'use_sim_time': True,               # Use simulation time
-            'resolution': 0.25,                 # Voxel size (meters)
+            'resolution': 2,                 # Voxel size (meters)
             'frame_id': 'world',                # Fixed frame (map/world)
             'base_frame_id': 'true_body',       # Robot base frame
             'sensor_model/max_range': 5.0,      # Max range to update map
