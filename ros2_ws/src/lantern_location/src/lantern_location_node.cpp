@@ -12,10 +12,6 @@
 #include "message_filters/subscriber.h"
 #include "message_filters/time_synchronizer.h"
 #include "message_filters/sync_policies/approximate_time.h"
-#include "tf2_ros/buffer.h"
-#include "tf2_ros/transform_listener.h"
-#include "tf2/LinearMath/Transform.h"
-#include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
 // Define the namespace for this node
 namespace lantern_location
@@ -34,10 +30,6 @@ public:
     // Depth scale parameter (conversion from depth units to meters)
     this->declare_parameter("depth_scale", 0.001);  // mm to meters
     depth_scale_ = this->get_parameter("depth_scale").as_double();
-
-    // Initialize TF2 for coordinate transformations
-    tf_buffer_ = std::make_unique<tf2_ros::Buffer>(this->get_clock());
-    tf_listener_ = std::make_unique<tf2_ros::TransformListener>(*tf_buffer_);
 
     // Subscribe to depth camera info to get intrinsics
     depth_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
@@ -72,13 +64,10 @@ public:
       "/lantern_location/filtered_depth", 10);
     pointcloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       "/lantern_location/filtered_pointcloud", 10);
-    pointcloud_transformed_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
-      "/lantern_location/filtered_pointcloud_map", 10);
 
     // Pre-allocate buffers (will be resized on first use if needed)
     filtered_depth_ = std::make_shared<sensor_msgs::msg::Image>();
     cloud_ = std::make_shared<sensor_msgs::msg::PointCloud2>();
-    cloud_transformed_ = std::make_shared<sensor_msgs::msg::PointCloud2>();
   }
 
 private:
@@ -185,43 +174,16 @@ private:
 
     // Setup point cloud structure (only reallocate if size changed)
     // Use Quadrotor/DepthCamera which exists in the TF tree
+    // RViz can transform to any frame (e.g., world) using the TF tree
     if (cloud_->width != width || cloud_->height != height) {
       setup_pointcloud_fields(*cloud_, width, height, "Quadrotor/DepthCamera");
     }
     cloud_->header.stamp = depth_image->header.stamp;
 
-    // Get transform early (before processing points)
-    bool have_transform = false;
-    tf2::Transform tf2_transform;
-    try {
-      auto transform = tf_buffer_->lookupTransform(
-        "map", cloud_->header.frame_id, cloud_->header.stamp,
-        std::chrono::milliseconds(50));
-      tf2::fromMsg(transform.transform, tf2_transform);
-      have_transform = true;
-
-      // Prepare transformed cloud buffer
-      if (cloud_transformed_->width != width || cloud_transformed_->height != height) {
-        setup_pointcloud_fields(*cloud_transformed_, width, height, "map");
-      }
-      cloud_transformed_->header.stamp = depth_image->header.stamp;
-    } catch (const tf2::TransformException& e) {
-      RCLCPP_DEBUG_THROTTLE(get_logger(), *get_clock(), 5000,
-        "Transform to map unavailable: %s", e.what());
-    }
-
-    // Single pass: compute 3D points and optionally transform
+    // Compute 3D points in camera frame
     sensor_msgs::PointCloud2Iterator<float> iter_x(*cloud_, "x");
     sensor_msgs::PointCloud2Iterator<float> iter_y(*cloud_, "y");
     sensor_msgs::PointCloud2Iterator<float> iter_z(*cloud_, "z");
-
-    // Only create transformed iterators if we have a valid transform
-    std::unique_ptr<sensor_msgs::PointCloud2Iterator<float>> iter_tx, iter_ty, iter_tz;
-    if (have_transform) {
-      iter_tx = std::make_unique<sensor_msgs::PointCloud2Iterator<float>>(*cloud_transformed_, "x");
-      iter_ty = std::make_unique<sensor_msgs::PointCloud2Iterator<float>>(*cloud_transformed_, "y");
-      iter_tz = std::make_unique<sensor_msgs::PointCloud2Iterator<float>>(*cloud_transformed_, "z");
-    }
 
     const uint16_t* depth_ptr = reinterpret_cast<const uint16_t*>(depth_image->data.data());
     int valid_points = 0;
@@ -231,12 +193,8 @@ private:
 
       if (depth_value == 0) {
         *iter_x = *iter_y = *iter_z = std::numeric_limits<float>::quiet_NaN();
-        if (have_transform) {
-          **iter_tx = **iter_ty = **iter_tz = std::numeric_limits<float>::quiet_NaN();
-          ++(*iter_tx); ++(*iter_ty); ++(*iter_tz);
-        }
       } else {
-        // Convert pixel to 3D point
+        // Convert pixel to 3D point in camera frame
         const int u = i % width;
         const int v = i / width;
         const float z = depth_value * depth_scale_;
@@ -252,22 +210,11 @@ private:
           RCLCPP_INFO(get_logger(), "Point %d: pixel(%d,%d) depth=%u -> XYZ(%.3f, %.3f, %.3f)",
             valid_points, u, v, depth_value, x, y, z);
         }
-
-        if (have_transform) {
-          tf2::Vector3 pt_transformed = tf2_transform * tf2::Vector3(x, y, z);
-          **iter_tx = pt_transformed.x();
-          **iter_ty = pt_transformed.y();
-          **iter_tz = pt_transformed.z();
-          ++(*iter_tx); ++(*iter_ty); ++(*iter_tz);
-        }
         ++valid_points;
       }
     }
 
     pointcloud_pub_->publish(*cloud_);
-    if (have_transform) {
-      pointcloud_transformed_pub_->publish(*cloud_transformed_);
-    }
 
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
       "Published point cloud: %d valid points / %zu total", valid_points, num_pixels);
@@ -284,16 +231,10 @@ private:
   // Publishers
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr filtered_depth_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
-  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_transformed_pub_;
-
-  // TF2
-  std::unique_ptr<tf2_ros::Buffer> tf_buffer_;
-  std::unique_ptr<tf2_ros::TransformListener> tf_listener_;
 
   // Pre-allocated buffers
   sensor_msgs::msg::Image::SharedPtr filtered_depth_;
   sensor_msgs::msg::PointCloud2::SharedPtr cloud_;
-  sensor_msgs::msg::PointCloud2::SharedPtr cloud_transformed_;
 
   // Camera intrinsics (from CameraInfo subscription)
   bool have_camera_info_ = false;
