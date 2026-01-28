@@ -16,6 +16,7 @@
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Vector3.h>
 #include <nav_msgs/msg/odometry.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 
 /**
  * LocalPlannerNode - Frontier-Based Exploration Local Planner
@@ -39,6 +40,7 @@ public:
   {
     // Create publisher for frontier goals
     frontier_publisher_ = create_publisher<geometry_msgs::msg::Point>("/frontier_goal", 10);
+    marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>("/frontier_goal_marker", 10);
     
     // Subscribe to Octomap updates and bind it to octomap callback (does frontier evaluation)
     octomap_subscription_ = create_subscription<octomap_msgs::msg::Octomap>(
@@ -49,7 +51,7 @@ public:
     
     // Subscribe to odometry for drone pose and orientation
     odom_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/true_pose", 10,
+      "/current_state", 10,
       std::bind(&LocalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
     
@@ -60,12 +62,14 @@ public:
 
 private:
   rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr frontier_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_publisher_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
 
   // Configuration
-  const float exploration_radius_ = 1.0;    // Radius around frontier to calculate gain
+  const float exploration_radius_ = 5.0;    // Radius around frontier to calculate gain
   const float occupied_threshold_ = 0.5;    // Occupancy probability threshold
+  const float search_radius_ = 20.0;        // Optimization: Search radius increased for larger caves (20m diam)
 
   // Store latest drone pose and orientation
   geometry_msgs::msg::Point last_drone_position_;
@@ -104,10 +108,22 @@ private:
     RCLCPP_DEBUG(get_logger(), "Found %lu frontier points", frontier_points.size());
     
     // 2. Find frontier with highest exploration gain
-    octomap::point3d best_point = frontier_points[0];
+    // Optimization: Downsample frontiers if there are too many to process in real-time
+    std::vector<octomap::point3d> points_to_evaluate;
+    if (frontier_points.size() > 50) {
+      // Pick ~50 points distributed across the vector
+      size_t stride = frontier_points.size() / 50;
+      for (size_t i = 0; i < frontier_points.size(); i += stride) {
+        points_to_evaluate.push_back(frontier_points[i]);
+      }
+    } else {
+      points_to_evaluate = frontier_points;
+    }
+
+    octomap::point3d best_point = points_to_evaluate[0];
     float best_gain = 0.0;
     
-    for (const auto& point : frontier_points) {
+    for (const auto& point : points_to_evaluate) {
       float exploration_gain = calculate_exploration_gain(octree, point, exploration_radius_);
       float direction_gain = calculate_direction_gain(point);
       
@@ -127,6 +143,27 @@ private:
     goal_msg.z = best_point.z();
     
     frontier_publisher_->publish(goal_msg);
+
+    // Publish marker for visualization in RViz
+    visualization_msgs::msg::Marker marker;
+    marker.header = msg->header; // Use the same frame as the octomap
+    marker.header.stamp = this->get_clock()->now();
+    marker.ns = "frontier_goal";
+    marker.id = 0;
+    marker.type = visualization_msgs::msg::Marker::SPHERE;
+    marker.action = visualization_msgs::msg::Marker::ADD;
+    marker.pose.position.x = goal_msg.x;
+    marker.pose.position.y = goal_msg.y;
+    marker.pose.position.z = goal_msg.z;
+    marker.pose.orientation.w = 1.0;
+    marker.scale.x = 5.0;
+    marker.scale.y = 5.0;
+    marker.scale.z = 5.0;
+    marker.color.a = 1.0;
+    marker.color.r = 0.0;
+    marker.color.g = 1.0;
+    marker.color.b = 0.0;
+    marker_publisher_->publish(marker);
     
     RCLCPP_INFO(get_logger(),
                 "Published frontier goal: (%.2f, %.2f, %.2f) with gain %.2f",
@@ -145,8 +182,14 @@ private:
   std::vector<octomap::point3d> get_frontier_points(octomap::OcTree* octree)
   {
     std::vector<octomap::point3d> frontiers;
+    octomap::point3d drone_position(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
     
     for (auto leaf = octree->begin_leafs(); leaf != octree->end_leafs(); ++leaf) {
+      // Optimization: Bounding box check first (fastest) - skip far away points
+      if (leaf.getCoordinate().distance(drone_position) > search_radius_) {
+        continue;
+      }
+
       // Only consider free cells
       if (leaf->getOccupancy() < occupied_threshold_) {
         double size = octree->getNodeSize(leaf.getDepth());
@@ -160,6 +203,8 @@ private:
         };
         
         bool is_frontier = false;
+        bool is_safe = true; // Optimization: Safety check
+
         for (auto& dir : directions) {
           octomap::point3d neighbor_point = 
             leaf_coordinate + octomap::point3d(dir[0], dir[1], dir[2]);
@@ -168,11 +213,14 @@ private:
           // If neighbor doesn't exist in tree, it's unknown → this is a frontier
           if (!neighbor_node) {
             is_frontier = true;
-            break;
+          } else if (neighbor_node->getOccupancy() > occupied_threshold_) {
+             // Neighbor is an obstacle -> unsafe
+             is_safe = false;
+             break;
           }
         }
         
-        if (is_frontier) {
+        if (is_frontier && is_safe) {
           frontiers.push_back(leaf_coordinate);
         }
       }
@@ -197,11 +245,13 @@ private:
     int unknown_voxels = 0;
     int total_voxels = 0;
     float voxel_size = octree->getResolution();
+    // Optimization: Use a coarser step size for gain calculation (min 0.2m) to avoid exponential cost
+    float step_size = (voxel_size > 0.2f) ? voxel_size : 0.2f;
     
     // Create a search grid around the point
-    for (float dx = -radius; dx <= radius; dx += voxel_size) {
-      for (float dy = -radius; dy <= radius; dy += voxel_size) {
-        for (float dz = -radius; dz <= radius; dz += voxel_size) {
+    for (float dx = -radius; dx <= radius; dx += step_size) {
+      for (float dy = -radius; dy <= radius; dy += step_size) {
+        for (float dz = -radius; dz <= radius; dz += step_size) {
           octomap::point3d search_point = point + octomap::point3d(dx, dy, dz);
           total_voxels++;
           
