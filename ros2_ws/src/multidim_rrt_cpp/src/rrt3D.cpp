@@ -34,8 +34,7 @@ class RRT3DNode : public rclcpp::Node
 {
 public:
   RRT3DNode()
-      : Node("RRT3DNode"), start_x(0), start_y(0), start_z(0), goal_x(5), goal_y(5), goal_z(5),
-        step_size(0.5), goal_tolerance(1), map_sub_mode(false), obstacle_sub_mode(false),
+      : Node("RRT3DNode"), step_size(0.5), goal_tolerance(1), map_sub_mode(false), obstacle_sub_mode(false),
         node_limit(10000), wall_confidence(50)
   {
     // Create publisher for the planned path

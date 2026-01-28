@@ -1,0 +1,9 @@
+planner:
+  ros__parameters:
+    max_velocity: 20.0
+    max_acceleration: 5.0
+    
+    waypoints: [
+      -55.0, 10.0, 12.0,
+      -280.0, 9.0, 16.0, 
+    ]

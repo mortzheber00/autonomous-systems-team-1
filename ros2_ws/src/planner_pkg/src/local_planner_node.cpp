@@ -1,3 +1,13 @@
+/**
+ * @file local_planner_node.cpp written by Phil Chudalla
+ * @brief Frontier-Based Exploration Local Planner
+ * This ROS 2 node implements a local planner that:
+ * 1. Subscribes to Octomap updates from the mapping system
+ * 2. Identifies frontier cells (boundaries between explored and unexplored space)
+ * 3. Calculates exploration gain for each frontier
+ * 4. Publishes the frontier with highest gain for the trajectory planner to execute
+ */
+
 #include <rclcpp/rclcpp.hpp>
 #include <octomap/octomap.h>
 #include <octomap_msgs/conversions.h>
@@ -73,6 +83,8 @@ private:
     octomap::AbstractOcTree* tree = octomap_msgs::msgToMap(*msg);
     octomap::OcTree* octree = dynamic_cast<octomap::OcTree*>(tree);
     
+    RCLCPP_WARN(get_logger(), "Octomap_callback triggered");
+
     // Check for valid octree
     if (!octree) {
       RCLCPP_WARN(get_logger(), "Failed to cast Octomap message to OcTree");
