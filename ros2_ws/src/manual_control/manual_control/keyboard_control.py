@@ -29,7 +29,7 @@ class KeyboardControlNode(Node):
         self.initial_pose_set = False
         
         # Threshold: only accept new inputs if drone is within this distance
-        self.proximity_threshold = 1.5  # meters
+        self.proximity_threshold = 9.0  # meters
         
         # Create publisher and subscriber
         self.trajectory_pub = self.create_publisher(
@@ -109,7 +109,7 @@ class KeyboardControlNode(Node):
         return math.sqrt(dx*dx + dy*dy + dz*dz)
     
     def key_to_trajectory(self, key: str) -> MultiDOFJointTrajectoryPoint:
-        step_size = 1.0
+        step_size = 3.0
         rotation_step_size = 0.1
         
         # Work with internal desired state (not current_pose!)
@@ -187,10 +187,10 @@ class KeyboardControlNode(Node):
                     dist = self.distance_to_desired()
                     
                     if dist > self.proximity_threshold:
-                        self.get_logger().warn(
-                            f'Drone too far from target ({dist:.2f}m > {self.proximity_threshold}m). '
-                            f'Wait for drone to reach waypoint first!'
-                        )
+                        ##self.get_logger().warn(
+                        ##    f'Drone too far from target ({dist:.2f}m > {self.proximity_threshold}m). '
+                        ##    f'Wait for drone to reach waypoint first!'
+                        ##)
                         continue
                     
                     # Generate and publish new trajectory

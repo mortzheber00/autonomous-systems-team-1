@@ -114,10 +114,10 @@ public:
     //  PART 6 [NOTE: save this for last] |  Tune your gains!
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Controller gains 
-    kx = 11.0;
-    kv = 5.6;
+    kx = 3.0;
+    kv = 3.6;
     kr = 10.0;
-    komega = 1.8;
+    komega = 2.0;
 
     // Initialize constants
     m = 1.0;
