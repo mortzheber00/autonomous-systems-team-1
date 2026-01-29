@@ -32,7 +32,7 @@ def generate_launch_description():
             'resolution': 2.0,                 # Voxel size (meters)
             'frame_id': 'world',                # Fixed frame (map/world)
             'base_frame_id': 'true_body',       # Robot base frame
-            'sensor_model.max_range': 40.0,      # Max range to update map
+            'sensor_model.max_range': 60.0,      # Max range to update map
             'filter_ground': False,             # Filter out floor plane?
             'latch:': False                       
         }],

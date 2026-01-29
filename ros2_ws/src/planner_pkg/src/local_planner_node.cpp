@@ -7,6 +7,7 @@
 #include <tf2/LinearMath/Vector3.h>
 #include <nav_msgs/msg/odometry.hpp>
 #include <visualization_msgs/msg/marker.hpp>
+#include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 
 /**
  * LocalPlannerNode - Frontier-Based Exploration Local Planner
@@ -31,6 +32,7 @@ public:
     // Create publisher for frontier goals
     frontier_publisher_ = create_publisher<geometry_msgs::msg::Point>("/frontier_goal", 10);
     marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>("/frontier_goal_marker", 10);
+    trajectory_publisher_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>("/command/trajectory", 10);
     
     // Subscribe to Octomap updates and bind it to octomap callback (does frontier evaluation)
     octomap_subscription_ = create_subscription<octomap_msgs::msg::Octomap>(
@@ -53,6 +55,7 @@ public:
 private:
   rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr frontier_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_publisher_;
+  rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr trajectory_publisher_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
 
@@ -96,16 +99,28 @@ private:
     RCLCPP_DEBUG(get_logger(), "Found %lu frontier points", frontier_points.size());
     
     // 2. Find frontier with highest exploration gain
+    
+    // Filter frontiers to keep only those within the cave (x < -350)
+    std::vector<octomap::point3d> cave_frontiers;
+    for (const auto& point : frontier_points) {
+      if (point.x() < -370.0) {
+        cave_frontiers.push_back(point);
+      }
+    }
+
+    // Use cave frontiers if available to enforce staying inside
+    const std::vector<octomap::point3d>& candidates = cave_frontiers.empty() ? frontier_points : cave_frontiers;
+
     // Optimization: Downsample frontiers if there are too many to process in real-time
     std::vector<octomap::point3d> points_to_evaluate;
-    if (frontier_points.size() > 50) {
+    if (candidates.size() > 50) {
       // Pick ~50 points distributed across the vector
-      size_t stride = frontier_points.size() / 50;
-      for (size_t i = 0; i < frontier_points.size(); i += stride) {
-        points_to_evaluate.push_back(frontier_points[i]);
+      size_t stride = candidates.size() / 50;
+      for (size_t i = 0; i < candidates.size(); i += stride) {
+        points_to_evaluate.push_back(candidates[i]);
       }
     } else {
-      points_to_evaluate = frontier_points;
+      points_to_evaluate = candidates;
     }
 
     octomap::point3d best_point = points_to_evaluate[0];
@@ -116,7 +131,7 @@ private:
       float direction_gain = calculate_direction_gain(point);
       
       // Combine gains (with equal weighting for now)
-      float total_gain = exploration_gain + direction_gain;
+      float total_gain = 2*exploration_gain + direction_gain;
       
       if (total_gain > best_gain) {
         best_gain = total_gain;
@@ -132,6 +147,55 @@ private:
     
     frontier_publisher_->publish(goal_msg);
 
+    // Publish trajectory
+    trajectory_msgs::msg::MultiDOFJointTrajectory trajectory_msg;
+    trajectory_msg.header = msg->header;
+    trajectory_msg.joint_names.push_back("base_link");
+
+    trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
+    geometry_msgs::msg::Transform transform;
+    transform.translation.x = best_point.x();
+    transform.translation.y = best_point.y();
+    transform.translation.z = best_point.z();
+    
+    // Calculate desired yaw based on direction to frontier
+    double dx = best_point.x() - last_drone_position_.x;
+    double dy = best_point.y() - last_drone_position_.y;
+    double yaw = atan2(dy, dx);
+
+    tf2::Quaternion q;
+    q.setRPY(0, 0, yaw);
+
+    transform.rotation.x = q.x();
+    transform.rotation.y = q.y();
+    transform.rotation.z = q.z();
+    transform.rotation.w = q.w(); 
+
+    point.transforms.push_back(transform);
+
+    // Populate velocities and accelerations (required by controller)
+    geometry_msgs::msg::Twist velocity;
+    velocity.linear.x = 0.0;
+    velocity.linear.y = 0.0;
+    velocity.linear.z = 0.0;
+    velocity.angular.x = 0.0;
+    velocity.angular.y = 0.0;
+    velocity.angular.z = 0.0;
+    point.velocities.push_back(velocity);
+
+    geometry_msgs::msg::Twist acceleration;
+    acceleration.linear.x = 0.0;
+    acceleration.linear.y = 0.0;
+    acceleration.linear.z = 0.0;
+    acceleration.angular.x = 0.0;
+    acceleration.angular.y = 0.0;
+    acceleration.angular.z = 0.0;
+    point.accelerations.push_back(acceleration);
+
+    trajectory_msg.points.push_back(point);
+    
+    trajectory_publisher_->publish(trajectory_msg);
+
     // Publish marker for visualization in RViz
     visualization_msgs::msg::Marker marker;
     marker.header = msg->header; // Use the same frame as the octomap
@@ -140,9 +204,7 @@ private:
     marker.id = 0;
     marker.type = visualization_msgs::msg::Marker::SPHERE;
     marker.action = visualization_msgs::msg::Marker::ADD;
-    marker.pose.position.x = goal_msg.x;
-    marker.pose.position.y = goal_msg.y;
-    marker.pose.position.z = goal_msg.z;
+    marker.pose.position = goal_msg;
     marker.pose.orientation.w = 1.0;
     marker.scale.x = 5.0;
     marker.scale.y = 5.0;
@@ -162,11 +224,34 @@ private:
   }
 
   /**
-   * Identify all frontier cells in the Octomap
-   * 
-   * A frontier cell is a free voxel adjacent to at least one unknown voxel.
-   * These represent the boundary between explored and unexplored space.
+   * Check if a ray from the drone to the target point is unblocked.
+   * Returns true if visible (no obstacles in path), false otherwise.
    */
+  bool is_point_visible(octomap::OcTree* octree, const octomap::point3d& target)
+  {
+    octomap::point3d drone_pos(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
+    
+    // Direction vector from drone to target
+    octomap::point3d direction = target - drone_pos;
+    double length = direction.norm();
+
+    // If extremely close, consider it visible
+    if (length < 0.1) return true;
+
+    octomap::point3d end_point;
+    
+    // castRay returns true if an obstacle is hit within the specified length.
+    // Since we want center points, any hit before the target means it is occluded.
+    // 'true' in 4th arg means ignore unknown cells (treat as free), only stop on occupied.
+    bool hit_obstacle = octree->castRay(drone_pos, direction, end_point, true, length);
+    
+    if (hit_obstacle) {
+      return false; // Blocked by wall
+    }
+    
+    return true; // Clear path
+  }
+
   std::vector<octomap::point3d> get_frontier_points(octomap::OcTree* octree)
   {
     std::vector<octomap::point3d> frontiers;
@@ -191,7 +276,7 @@ private:
         };
         
         bool is_frontier = false;
-        bool is_safe = true; // Optimization: Safety check
+        bool is_safe = true;
 
         for (auto& dir : directions) {
           octomap::point3d neighbor_point = 
@@ -209,7 +294,10 @@ private:
         }
         
         if (is_frontier && is_safe) {
-          frontiers.push_back(leaf_coordinate);
+          // NEW: Only add frontier if it is visible from the drone
+          if (is_point_visible(octree, leaf_coordinate)) {
+             frontiers.push_back(leaf_coordinate);
+          }
         }
       }
     }
@@ -229,32 +317,57 @@ private:
                                    const octomap::point3d& point,
                                    float radius)
   {
-    // Count unknown and total voxels in a grid around the frontier point
     int unknown_voxels = 0;
     int total_voxels = 0;
     float voxel_size = octree->getResolution();
-    // Optimization: Use a coarser step size for gain calculation (min 0.2m) to avoid exponential cost
     float step_size = (voxel_size > 0.2f) ? voxel_size : 0.2f;
     
-    // Create a search grid around the point
+    // 1. Calculate Standard Exploration Gain (Volume of Unknowns)
     for (float dx = -radius; dx <= radius; dx += step_size) {
       for (float dy = -radius; dy <= radius; dy += step_size) {
         for (float dz = -radius; dz <= radius; dz += step_size) {
           octomap::point3d search_point = point + octomap::point3d(dx, dy, dz);
           total_voxels++;
-          
-          // If the voxel doesn't exist in the octree, it's unknown
           if (!octree->search(search_point)) {
             unknown_voxels++;
           }
         }
       }
     }
-    // Return normalized gain [0, 1]
-    if (total_voxels == 0) {
-      return 0.0;
+
+    if (total_voxels == 0) return 0.0;
+    float volume_gain = static_cast<float>(unknown_voxels) / static_cast<float>(total_voxels);
+
+    // 2. Calculate "Center of Cave" Penalty (Proximity to Obstacles)
+    // We check a small safety sphere (e.g., 1.0m) around the frontier.
+    // If we find occupied cells, we apply a penalty.
+    float safety_radius = 1.0; 
+    bool near_obstacle = false;
+    
+    // Quick check: Look at 6 directions around the point
+    double check_dirs[6][3] = {
+        {safety_radius, 0, 0}, {-safety_radius, 0, 0},
+        {0, safety_radius, 0}, {0, -safety_radius, 0},
+        {0, 0, safety_radius}, {0, 0, -safety_radius}
+    };
+
+    for (auto& dir : check_dirs) {
+        octomap::point3d check_p = point + octomap::point3d(dir[0], dir[1], dir[2]);
+        octomap::OcTreeNode* node = octree->search(check_p);
+        if (node && octree->isNodeOccupied(node)) {
+            near_obstacle = true;
+            break; 
+        }
     }
-    return static_cast<float>(unknown_voxels) / static_cast<float>(total_voxels);
+
+    // Apply Penalty
+    // If near a wall, reduce gain by 40%. This biases the planner 
+    // to choose points with similar unknown volume but simpler geometry (center).
+    if (near_obstacle) {
+        return volume_gain * 0.6; 
+    }
+
+    return volume_gain;
   }
 
   /**
