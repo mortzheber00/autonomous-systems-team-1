@@ -34,7 +34,7 @@
  
    // Define goal point
    Eigen::Vector3d goal_position, goal_velocity;
-   goal_position << -340.0, 9.0, 16.0; //12.0, 39.0, 9.0
+   goal_position << -360.0, 0.0, 16.0; //12.0, 39.0, 9.0
    goal_velocity << 0.0, 0.0, 0.0;
  
    // Plan and publish trajectory
