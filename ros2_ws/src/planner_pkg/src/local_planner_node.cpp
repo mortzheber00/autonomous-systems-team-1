@@ -390,28 +390,31 @@ private:
     float volume_gain = static_cast<float>(unknown_voxels) / static_cast<float>(total_voxels);
 
     // 2. Safety Penalty
-    bool near_obstacle = false;
+    double min_dist = safety_radius_;
+    octomap::point3d end_point;
     
-    double check_dirs[6][3] = {
-        {safety_radius_, 0, 0}, {-safety_radius_, 0, 0},
-        {0, safety_radius_, 0}, {0, -safety_radius_, 0},
-        {0, 0, safety_radius_}, {0, 0, -safety_radius_}
+    // Check 6 cardinal directions using raycasting to detect obstacles within safety_radius_
+    octomap::point3d directions[6] = {
+        octomap::point3d(1, 0, 0), octomap::point3d(-1, 0, 0),
+        octomap::point3d(0, 1, 0), octomap::point3d(0, -1, 0),
+        octomap::point3d(0, 0, 1), octomap::point3d(0, 0, -1)
     };
 
-    for (auto& dir : check_dirs) {
-        octomap::point3d check_p = point + octomap::point3d(dir[0], dir[1], dir[2]);
-        octomap::OcTreeNode* node = octree->search(check_p);
-        if (node && octree->isNodeOccupied(node)) {
-            near_obstacle = true;
-            break; 
+    for (const auto& dir : directions) {
+        // castRay to find distance to obstacles
+        if (octree->castRay(point, dir, end_point, true, safety_radius_)) {
+            double dist = (end_point - point).norm();
+            if (dist < min_dist) {
+                min_dist = dist;
+            }
         }
     }
 
-    if (near_obstacle) {
-        return volume_gain * 0.1; 
-    }
+    // Gradient penalty: Linear scaling from 0.1 (at wall) to 1.0 (at safety_radius_)
+    // This encourages the drone to center itself in corridors/caves
+    double penalty_factor = 0.1 + 0.9 * (min_dist / safety_radius_);
 
-    return volume_gain;
+    return volume_gain * penalty_factor;
   }
 
   /**
