@@ -107,6 +107,10 @@ private:
   
   // Moving average of drone movement direction
   std::vector<tf2::Vector3> movement_history_;  // History of drone movement vectors
+  
+  // Track repeated frontiers for backtracking detection
+  octomap::point3d last_frontier_point_;
+  int repeated_frontier_count_ = 0;  // Counter for consecutive times same frontier is selected
 
   /**
    * Callback for Octomap subscription
@@ -132,7 +136,8 @@ private:
     // 1. Identify frontier points
     std::vector<octomap::point3d> frontier_points = get_frontier_points(octree);
     
-    if (frontier_points.empty()) {
+    // If no frontiers found or the frontier is the same 10 times in a row, check if we can backtrack
+    if (frontier_points.empty() || repeated_frontier_count_ >= 10) {
       RCLCPP_WARN(get_logger(), "No frontier points found locally. Global planner will handle backtracking.");
       delete tree;
       return;

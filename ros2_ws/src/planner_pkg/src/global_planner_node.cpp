@@ -83,7 +83,7 @@ public:
     
     // Subscribe to drone odometry for position tracking and flight path recording
     odom_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/true_pose", 10,
+      "/current_state", 10,
       std::bind(&GlobalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
     
@@ -125,10 +125,10 @@ private:
   std::vector<FrontierInfo> frontier_list_;
   int frontier_counter_ = 0;
   int frontier_added_since_prune_ = 0;  // Counter for frontier additions
-  const float frontier_proximity_threshold_ = 5.0;  // Distance to consider frontiers as same (reduced from 10m)
-  const int prune_interval_ = 5;                    // Prune every 5 new frontiers
-  const float min_gain_threshold_ = 0.15;            // Minimum gain to keep frontier (reduced from 2.0 - gains are [0,1])
-  const float exploration_radius_ = 5.0;            // Radius for exploration gain calculation
+  const float frontier_proximity_threshold_ = 2.0;  // Distance to consider frontiers as same (reduced from 10m)
+  const int prune_interval_ = 10;                    // Prune every 10 new frontiers
+  const float min_gain_threshold_ = 0.15;            // Minimum gain to keep frontier
+  const float exploration_radius_ = 3.0;            // Radius for exploration gain calculation
   
   // Flight tracking
   std::vector<geometry_msgs::msg::Point> flown_points_;
@@ -252,8 +252,6 @@ private:
       RCLCPP_WARN(get_logger(), "[GLOBAL] No flown points recorded yet. Frontiers: %lu", frontier_list_.size());
     }
   }
-    }
-  }
 
   /**
    * Find frontier within proximity threshold
@@ -314,13 +312,13 @@ private:
     }
     
     nav_msgs::msg::Path backtrack_path;
-    backtrack_path.header.frame_id = "map";
+    backtrack_path.header.frame_id = "world";
     backtrack_path.header.stamp = get_clock()->now();
     
     // Add flown points in reverse order (backtrack from current position back through path)
     for (auto it = flown_points_.rbegin(); it != flown_points_.rend(); ++it) {
       geometry_msgs::msg::PoseStamped pose;
-      pose.header.frame_id = "map";
+      pose.header.frame_id = "world";
       pose.header.stamp = get_clock()->now();
       pose.pose.position = *it;
       backtrack_path.poses.push_back(pose);
@@ -328,7 +326,7 @@ private:
     
     // Add the target frontier as final waypoint
     geometry_msgs::msg::PoseStamped final_pose;
-    final_pose.header.frame_id = "map";
+    final_pose.header.frame_id = "world";
     final_pose.header.stamp = get_clock()->now();
     final_pose.pose.position = target_frontier->position;
     backtrack_path.poses.push_back(final_pose);
@@ -486,7 +484,7 @@ private:
     
     for (const auto& frontier : frontier_list_) {
       visualization_msgs::msg::Marker marker;
-      marker.header.frame_id = "map";
+      marker.header.frame_id = "world";
       marker.header.stamp = get_clock()->now();
       marker.ns = "frontiers";
       marker.id = marker_id++;
@@ -535,7 +533,7 @@ private:
     // Add text marker showing total frontier count
     if (!frontier_list_.empty() && current_position_.x != 0 && current_position_.y != 0) {
       visualization_msgs::msg::Marker text_marker;
-      text_marker.header.frame_id = "map";
+      text_marker.header.frame_id = "world";
       text_marker.header.stamp = get_clock()->now();
       text_marker.ns = "frontier_stats";
       text_marker.id = 10000;  // Use high ID to avoid conflicts
