@@ -10,11 +10,9 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
 #include "geometry_msgs/msg/point_stamped.hpp"
-#include "nav_msgs/msg/odometry.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 #include "message_filters/subscriber.h"
-#include "message_filters/time_synchronizer.h"
 #include "message_filters/sync_policies/approximate_time.h"
 #include "tf2_ros/transform_listener.h"
 #include "tf2_ros/buffer.h"
@@ -34,7 +32,6 @@ struct DetectedLantern
   geometry_msgs::msg::Point position;  // Average position in world frame
   geometry_msgs::msg::Point sum;       // Sum of all detections for true average
   int update_count;                     // Number of times this lantern was updated
-  rclcpp::Time last_seen;              // Last time this lantern was detected
 };
 
 class LanternLocationNode : public rclcpp::Node
@@ -74,8 +71,6 @@ public:
           principal_point_x_ = msg->k[2];
           principal_point_y_ = msg->k[5];
           have_camera_info_ = true;
-          RCLCPP_INFO(get_logger(), "Received camera intrinsics: fx=%.1f, fy=%.1f, cx=%.1f, cy=%.1f",
-            focal_length_x_, focal_length_y_, principal_point_x_, principal_point_y_);
         }
       });
 
@@ -124,9 +119,6 @@ private:
     if (frame_counter_ % frame_skip_ != 0) {
       return;
     }
-
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-      "Processing synchronized images (%ux%u)", depth_msg->width, depth_msg->height);
 
     // Check dimension match
     if (semantic_msg->width != depth_msg->width || 
@@ -307,33 +299,22 @@ private:
       avg_position_camera.y = sum_y / valid_points;
       avg_position_camera.z = sum_z / valid_points;
 
-      RCLCPP_INFO(get_logger(), 
-        "Detected lantern at camera frame: (%.3f, %.3f, %.3f) from %d points",
-        avg_position_camera.x, avg_position_camera.y, avg_position_camera.z, valid_points);
-
       // Transform to world coordinates using TF2
       geometry_msgs::msg::Point lantern_world = transform_to_world(avg_position_camera, frame_id, timestamp);
 
-      RCLCPP_INFO(get_logger(), 
-        "Transformed to world frame: (%.3f, %.3f, %.3f)",
-        lantern_world.x, lantern_world.y, lantern_world.z);
-
       // Update or add lantern to tracking list (in world coordinates)
       update_lantern_list(lantern_world, timestamp);
-      
-      // Clean up unconfirmed lanterns periodically (every 30 frames)
-      cleanup_counter_++;
-      if (cleanup_counter_ >= 30) {
-        cleanup_unconfirmed_lanterns();
-        cleanup_counter_ = 0;
-      }
-      
-      // Publish all detected lanterns (in world frame)
-      publish_lantern_locations(timestamp);
-    } else {
-      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-        "No valid lantern points detected in this frame");
     }
+    
+    // Clean up unconfirmed lanterns periodically (every 30 frames)
+    cleanup_counter_++;
+    if (cleanup_counter_ >= 30) {
+      cleanup_unconfirmed_lanterns();
+      cleanup_counter_ = 0;
+    }
+    
+    // Always publish all confirmed lanterns (even when not currently detected)
+    publish_lantern_locations(timestamp);
   }
 
   // Update or add a lantern to the tracking list (in world coordinates)
@@ -344,21 +325,12 @@ private:
     int closest_idx = -1;
     double min_distance = matching_distance_threshold_;
 
-    RCLCPP_INFO(get_logger(), 
-      "Checking new detection at world (%.2f, %.2f, %.2f) against %zu existing lanterns",
-      new_position_world.x, new_position_world.y, new_position_world.z, 
-      detected_lanterns_.size());
-
     for (size_t i = 0; i < detected_lanterns_.size(); ++i) {
       const auto& lantern = detected_lanterns_[i];
       double dx = new_position_world.x - lantern.position.x;
       double dy = new_position_world.y - lantern.position.y;
       double dz = new_position_world.z - lantern.position.z;
       double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
-
-      RCLCPP_INFO(get_logger(), 
-        "  Lantern #%zu at (%.2f, %.2f, %.2f): distance = %.2fm",
-        i, lantern.position.x, lantern.position.y, lantern.position.z, distance);
 
       if (distance < min_distance) {
         min_distance = distance;
@@ -380,33 +352,19 @@ private:
       lantern.position.x = lantern.sum.x / lantern.update_count;
       lantern.position.y = lantern.sum.y / lantern.update_count;
       lantern.position.z = lantern.sum.z / lantern.update_count;
-      lantern.last_seen = timestamp;
-
-      RCLCPP_INFO(get_logger(), 
-        "Updated lantern #%d at world (%.3f, %.3f, %.3f), updates: %d, distance: %.3fm",
-        closest_idx, lantern.position.x, lantern.position.y, lantern.position.z,
-        lantern.update_count, min_distance);
     } else {
       // Add new lantern (no existing lantern within threshold distance in world coordinates)
       DetectedLantern new_lantern;
       new_lantern.position = new_position_world;
       new_lantern.sum = new_position_world;  // Initialize sum
       new_lantern.update_count = 1;
-      new_lantern.last_seen = timestamp;
       detected_lanterns_.push_back(new_lantern);
-
-      RCLCPP_INFO(get_logger(), 
-        "Added new lantern #%zu at world (%.3f, %.3f, %.3f)",
-        detected_lanterns_.size() - 1, 
-        new_position_world.x, new_position_world.y, new_position_world.z);
     }
   }
 
   // Remove lanterns that haven't been confirmed (not enough updates)
   void cleanup_unconfirmed_lanterns()
   {
-    size_t initial_size = detected_lanterns_.size();
-    
     // Remove lanterns with too few updates
     detected_lanterns_.erase(
       std::remove_if(detected_lanterns_.begin(), detected_lanterns_.end(),
@@ -414,12 +372,6 @@ private:
           return lantern.update_count < min_updates_to_confirm_;
         }),
       detected_lanterns_.end());
-    
-    if (detected_lanterns_.size() < initial_size) {
-      RCLCPP_INFO(get_logger(), 
-        "Cleaned up %zu unconfirmed lantern(s), %zu remaining",
-        initial_size - detected_lanterns_.size(), detected_lanterns_.size());
-    }
   }
 
   // Publish all detected lanterns as visual markers (in world frame)
@@ -429,6 +381,11 @@ private:
 
     for (size_t i = 0; i < detected_lanterns_.size(); ++i) {
       const auto& lantern = detected_lanterns_[i];
+      
+      // Only publish confirmed lanterns (with enough updates)
+      if (lantern.update_count < min_updates_to_confirm_) {
+        continue;
+      }
       
       visualization_msgs::msg::Marker marker;
       marker.header.stamp = timestamp;
@@ -454,15 +411,13 @@ private:
       marker.color.b = 0.0;
       marker.color.a = 0.8;  // Slight transparency
       
-      marker.lifetime = rclcpp::Duration::from_seconds(2.0);
+      // Infinite lifetime for confirmed lanterns (they persist until manually removed)
+      marker.lifetime = rclcpp::Duration::from_seconds(0);
       
       marker_array.markers.push_back(marker);
     }
 
     lantern_locations_pub_->publish(marker_array);
-    
-    RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-      "Published %zu detected lantern(s)", detected_lanterns_.size());
   }
 
   // Synchronized subscribers
@@ -488,19 +443,19 @@ private:
 
   // Camera intrinsics (from CameraInfo subscription)
   bool have_camera_info_ = false;
-  double focal_length_x_ = 0.0;
-  double focal_length_y_ = 0.0;
-  double principal_point_x_ = 0.0;
-  double principal_point_y_ = 0.0;
-  double depth_scale_ = 0.001;
+  double focal_length_x_;
+  double focal_length_y_;
+  double principal_point_x_;
+  double principal_point_y_;
+  double depth_scale_;
 
   // Lantern tracking parameters and state
   std::vector<DetectedLantern> detected_lanterns_;
-  double matching_distance_threshold_ = 20.0;  // meters in world frame
-  int frame_skip_ = 5;  // Process every Nth frame
+  double matching_distance_threshold_;
+  int frame_skip_;
   int frame_counter_ = 0;
-  int min_updates_to_confirm_ = 3;  // Minimum updates before lantern is confirmed
-  int cleanup_counter_ = 0;  // Counter for periodic cleanup
+  int min_updates_to_confirm_;
+  int cleanup_counter_ = 0;
 };
 
 }  // namespace lantern_location
