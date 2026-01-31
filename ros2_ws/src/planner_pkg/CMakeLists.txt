@@ -14,8 +14,11 @@ find_package(mav_msgs REQUIRED)
 find_package(octomap_msgs REQUIRED)
 find_package(octomap REQUIRED)
 find_package(tf2 REQUIRED)
+find_package(tf2_eigen REQUIRED)
+find_package(tf2_geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(Eigen3 REQUIRED)
 
 if(BUILD_TESTING)
   find_package(ament_lint_auto REQUIRED)
@@ -31,6 +34,11 @@ endif()
 
 # Add local planner node executable
 add_executable(local_planner_node src/local_planner_node.cpp)
+
+target_include_directories(local_planner_node PUBLIC
+  ${EIGEN3_INCLUDE_DIRS}
+)
+
 ament_target_dependencies(local_planner_node
   rclcpp
   geometry_msgs
@@ -38,8 +46,11 @@ ament_target_dependencies(local_planner_node
   octomap_msgs
   octomap
   tf2
+  tf2_eigen
+  tf2_geometry_msgs
   visualization_msgs
   trajectory_msgs
+  Eigen3
 )
 
 # Install executable
