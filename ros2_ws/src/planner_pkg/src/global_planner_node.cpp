@@ -54,6 +54,7 @@ class GlobalPlannerNode : public rclcpp::Node
 public:
   GlobalPlannerNode() : Node("global_planner_node")
   {
+    // ----- Publishers -----
     // Create publisher for global goals
     global_goal_publisher_ = create_publisher<geometry_msgs::msg::Point>("/global_goal", 10);
     
@@ -66,14 +67,15 @@ public:
       std::bind(&GlobalPlannerNode::frontier_callback, this, std::placeholders::_1)
     );
     
+    // ----- Subscribers -----
     // Subscribe to drone odometry for position tracking
     odom_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
       "/true_pose", 10,
       std::bind(&GlobalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
     
-    // Subscribe to RRT path to track flown waypoints
-    path_subscription_ = create_subscription<nav_msgs::msg::Path>(
+    // Subscribe to local planner goal points to track flown waypoints
+    path_subscription_ = create_subscription<geometry_msgs::msg::Point>(
       "/path", 10,
       std::bind(&GlobalPlannerNode::path_callback, this, std::placeholders::_1)
     );

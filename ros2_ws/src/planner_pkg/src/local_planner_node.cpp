@@ -38,10 +38,12 @@ class LocalPlannerNode : public rclcpp::Node
 public:
   LocalPlannerNode() : Node("local_planner_node")
   {
+    // --- Publishers -----
     // Create publisher for frontier goals
     frontier_publisher_ = create_publisher<geometry_msgs::msg::Point>("/frontier_goal", 10);
     marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>("/frontier_goal_marker", 10);
     
+    // ----- Subscribers -----
     // Subscribe to Octomap updates and bind it to octomap callback (does frontier evaluation)
     octomap_subscription_ = create_subscription<octomap_msgs::msg::Octomap>(
       "/octomap_full",
