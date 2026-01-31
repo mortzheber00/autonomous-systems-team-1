@@ -94,15 +94,19 @@ private:
   };
 
   // Configuration
-  const float exploration_radius_ = 5.0;    // Radius around frontier to calculate gain
+  const float exploration_radius_ = 10.0;    // Radius around frontier to calculate gain
   const float occupied_threshold_ = 0.5;    // Occupancy probability threshold
   const float search_radius_ = 50.0;        // Optimization: Search radius increased for larger caves (20m diam)
   const float frontier_proximity_threshold_ = 2.0;  // Distance to consider frontiers as same
+  const size_t movement_history_size_ = 10;  // Number of movement samples for moving average
 
   // Store latest drone pose and orientation
   geometry_msgs::msg::Point last_drone_position_;
   tf2::Quaternion last_drone_orientation_;
   rclcpp::Time last_frontier_found_time_;
+  
+  // Moving average of drone movement direction
+  std::vector<tf2::Vector3> movement_history_;  // History of drone movement vectors
 
   /**
    * Callback for Octomap subscription
@@ -413,19 +417,48 @@ private:
   }
 
   /**
-   * Calculate direction gain based on drone heading
+   * Calculate direction gain based on drone movement history (moving average)
    * 
-   * Exploration gain is higher when the frontier is aligned with the drone's
-   * current heading direction. This function calculates the angle between the
-   * camera view direction and the frontier direction, normalizing the gain to [0,1].
-   * (1 = perfectly aligned, 0 = perpendicular or opposite)
+   * Instead of just using camera heading, this calculates gain based on the
+   * drone's overall movement direction over the last N samples (moving average).
+   * This biases frontier selection toward where the drone has been heading,
+   * making exploration more coherent and continuous.
+   * 
+   * Returns [0, 1] where 1.0 = perfectly aligned with movement direction, 0.0 = opposite
    */
   float calculate_direction_gain(const octomap::point3d& frontier_point)
   {
-    // Camera forward vector in drone body frame (assume x-axis)
-    tf2::Vector3 cam_forward_body(1, 0, 0);
-    // Rotate to world frame using last known orientation
-    tf2::Vector3 cam_forward_world = tf2::quatRotate(last_drone_orientation_, cam_forward_body);
+    // If we don't have enough movement history, fall back to camera heading
+    if (movement_history_.size() < 2) {
+      tf2::Vector3 cam_forward_body(1, 0, 0);
+      tf2::Vector3 cam_forward_world = tf2::quatRotate(last_drone_orientation_, cam_forward_body);
+      
+      tf2::Vector3 drone_pos(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
+      tf2::Vector3 frontier_vec(frontier_point.x() - drone_pos.x(),
+                                frontier_point.y() - drone_pos.y(),
+                                frontier_point.z() - drone_pos.z());
+      if (frontier_vec.length() == 0) return 0.0f;
+      frontier_vec.normalize();
+      cam_forward_world.normalize();
+      
+      double dot = cam_forward_world.dot(frontier_vec);
+      dot = std::clamp(dot, -1.0, 1.0);
+      float gain = static_cast<float>(cos(acos(dot)));
+      return (gain + 1.0f) / 2.0f;
+    }
+    
+    // Calculate average movement direction from history
+    tf2::Vector3 avg_movement(0, 0, 0);
+    for (const auto& movement : movement_history_) {
+      avg_movement += movement;
+    }
+    avg_movement /= movement_history_.size();
+    
+    if (avg_movement.length() < 0.01f) {
+      // Drone hasn't moved much, return neutral gain
+      return 0.5f;
+    }
+    avg_movement.normalize();
 
     // Vector from drone to frontier in world frame
     tf2::Vector3 drone_pos(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
@@ -434,25 +467,42 @@ private:
                               frontier_point.z() - drone_pos.z());
     if (frontier_vec.length() == 0) return 0.0f;
     frontier_vec.normalize();
-    cam_forward_world.normalize();
 
-    // Compute angle between camera view and frontier direction
-    double dot = cam_forward_world.dot(frontier_vec);
-    dot = std::clamp(dot, -1.0, 1.0); // Clamp for safety
-    double angle = acos(dot); // [0, pi]
+    // Compute angle between average movement direction and frontier direction
+    double dot = avg_movement.dot(frontier_vec);
+    dot = std::clamp(dot, -1.0, 1.0);
+    double angle = acos(dot);
 
     // Normalize: 1.0 if perfectly aligned, 0.0 if opposite
-    float gain = static_cast<float>(cos(angle)); // [-1,1]
-    gain = (gain + 1.0f) / 2.0f; // [0,1]
+    float gain = static_cast<float>(cos(angle));
+    gain = (gain + 1.0f) / 2.0f;
     return gain;
   }
 
 
   
-  // Store latest drone pose and orientation
+  // Store latest drone pose and orientation, and track movement history
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
-    last_drone_position_ = msg->pose.pose.position;
+    // Calculate movement vector from last position
+    geometry_msgs::msg::Point new_pos = msg->pose.pose.position;
+    tf2::Vector3 movement(
+      new_pos.x - last_drone_position_.x,
+      new_pos.y - last_drone_position_.y,
+      new_pos.z - last_drone_position_.z
+    );
+    
+    // Add to movement history if significant movement occurred
+    if (movement.length() > 0.1) {  // At least 10cm movement
+      movement_history_.push_back(movement);
+      
+      // Keep only the last N samples
+      if (movement_history_.size() > movement_history_size_) {
+        movement_history_.erase(movement_history_.begin());
+      }
+    }
+    
+    last_drone_position_ = new_pos;
     last_drone_orientation_ = tf2::Quaternion(
       msg->pose.pose.orientation.x,
       msg->pose.pose.orientation.y,

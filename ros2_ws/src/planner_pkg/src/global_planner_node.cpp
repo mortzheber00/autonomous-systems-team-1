@@ -125,10 +125,10 @@ private:
   std::vector<FrontierInfo> frontier_list_;
   int frontier_counter_ = 0;
   int frontier_added_since_prune_ = 0;  // Counter for frontier additions
-  const float frontier_proximity_threshold_ = 10.0;  // Distance to consider frontiers as same
-  const int prune_interval_ = 5;                     // Prune every 5 new frontiers
-  const float min_gain_threshold_ = 2.0;             // Minimum gain to keep frontier
-  const float exploration_radius_ = 5.0;             // Radius for exploration gain calculation
+  const float frontier_proximity_threshold_ = 5.0;  // Distance to consider frontiers as same (reduced from 10m)
+  const int prune_interval_ = 5;                    // Prune every 5 new frontiers
+  const float min_gain_threshold_ = 0.15;            // Minimum gain to keep frontier (reduced from 2.0 - gains are [0,1])
+  const float exploration_radius_ = 5.0;            // Radius for exploration gain calculation
   
   // Flight tracking
   std::vector<geometry_msgs::msg::Point> flown_points_;
@@ -151,25 +151,26 @@ private:
     
     if (existing != frontier_list_.end()) {
       // Frontier already exists nearby - will be re-evaluated with Octomap
-      RCLCPP_DEBUG(get_logger(), "Frontier already in list (ID: %d), will re-evaluate gain",
-                   existing->id);
+      RCLCPP_INFO(get_logger(), "Frontier already in list (ID: %d) at distance %.2f. Skipping duplicate.",
+                   existing->id, distance(existing->position, *msg));
     } else {
       // Add new frontier if under limit
       if (frontier_list_.size() < max_frontiers_) {
         frontier_list_.emplace_back(*msg, 0.5, frontier_counter_++);
         frontier_added_since_prune_++;
-        RCLCPP_DEBUG(get_logger(), "Added new frontier (ID: %d) at (%.2f, %.2f, %.2f). Total: %lu",
+        RCLCPP_INFO(get_logger(), "[FRONTIER] Added new frontier (ID: %d) at (%.2f, %.2f, %.2f). Total: %lu",
                     frontier_counter_ - 1, msg->x, msg->y, msg->z, frontier_list_.size());
         
         // After every 5 new frontiers, re-evaluate gains and prune
         if (frontier_added_since_prune_ >= prune_interval_) {
-          RCLCPP_INFO(get_logger(), "Reached prune interval (%d frontiers added). Re-evaluating gains and pruning...",
+          RCLCPP_INFO(get_logger(), "[PRUNE] Reached interval (%d frontiers added). Re-evaluating gains and pruning...",
                       frontier_added_since_prune_);
           prune_low_gain_frontiers();
           frontier_added_since_prune_ = 0;
         }
       } else {
-        RCLCPP_DEBUG(get_logger(), "Frontier list at maximum size, skipping new frontier");
+        RCLCPP_WARN(get_logger(), "Frontier list at maximum size (%lu), skipping new frontier at (%.2f, %.2f, %.2f)", 
+                    frontier_list_.size(), msg->x, msg->y, msg->z);
       }
     }
   }
@@ -234,20 +235,23 @@ private:
       FrontierInfo* best_frontier = select_best_frontier();
       
       if (best_frontier) {
-        RCLCPP_DEBUG(get_logger(), 
-                    "Best frontier ready (ID: %d, Gain: %.2f) at (%.2f, %.2f, %.2f). "
-                    "Flown points: %lu. Ready to publish backtrack path when local planner requests.",
+        RCLCPP_INFO(get_logger(), 
+                    "[BACKTRACK] Best frontier (ID: %d, Gain: %.3f) at (%.2f, %.2f, %.2f). "
+                    "Current pos: (%.2f, %.2f, %.2f). Flown points: %lu.",
                     best_frontier->id, best_frontier->exploration_gain,
                     best_frontier->position.x, best_frontier->position.y, best_frontier->position.z,
+                    current_position_.x, current_position_.y, current_position_.z,
                     flown_points_.size());
         
         // Publish backtrack path to guide drone through flown points to reach best frontier
         publish_backtrack_path(best_frontier);
       }
     } else if (frontier_list_.empty()) {
-      RCLCPP_DEBUG(get_logger(), "No frontiers in list yet");
+      RCLCPP_WARN(get_logger(), "[GLOBAL] No frontiers in list yet");
     } else if (flown_points_.empty()) {
-      RCLCPP_DEBUG(get_logger(), "No flown points recorded yet");
+      RCLCPP_WARN(get_logger(), "[GLOBAL] No flown points recorded yet. Frontiers: %lu", frontier_list_.size());
+    }
+  }
     }
   }
 
