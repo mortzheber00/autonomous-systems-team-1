@@ -63,7 +63,10 @@ private:
   const float exploration_radius_ = 5.0;    // Radius around frontier to calculate gain
   const float occupied_threshold_ = 0.5;    // Occupancy probability threshold
   const float search_radius_ = 20.0;        // Optimization: Search radius increased for larger caves (20m diam)
-
+  const float exploration_weight_ = 2.0;    // Weight for exploration gain
+  const float direction_weight_ = 1.0;      // Weight for direction gain
+  const float x_limit_position_ = -370.0;   // Limit position for cave boundary filtering
+  
   // Store latest drone pose and orientation
   geometry_msgs::msg::Point last_drone_position_;
   tf2::Quaternion last_drone_orientation_;
@@ -100,10 +103,10 @@ private:
     
     // 2. Find frontier with highest exploration gain
     
-    // Filter frontiers to keep only those within the cave (x < -350)
+    // Filter frontiers to keep only those within the cave
     std::vector<octomap::point3d> cave_frontiers;
     for (const auto& point : frontier_points) {
-      if (point.x() < -370.0) {
+      if (point.x() < x_limit_position_) {
         cave_frontiers.push_back(point);
       }
     }
@@ -131,7 +134,7 @@ private:
       float direction_gain = calculate_direction_gain(point);
       
       // Combine gains (with equal weighting for now)
-      float total_gain = 2*exploration_gain + direction_gain;
+      float total_gain = exploration_weight_*exploration_gain + direction_weight_*direction_gain;
       
       if (total_gain > best_gain) {
         best_gain = total_gain;
