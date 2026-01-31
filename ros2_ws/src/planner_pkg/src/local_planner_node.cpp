@@ -1,11 +1,12 @@
 /**
  * @file local_planner_node.cpp written by Phil Chudalla
- * @brief Frontier-Based Exploration Local Planner
+ * @brief Frontier-Based Exploration Local Planner with Global Backtracking
  * This ROS 2 node implements a local planner that:
  * 1. Subscribes to Octomap updates from the mapping system
  * 2. Identifies frontier cells (boundaries between explored and unexplored space)
  * 3. Calculates exploration gain for each frontier
  * 4. Publishes the frontier with highest gain for the trajectory planner to execute
+ * 5. Tracks flight history and backtracks to unexplored frontiers when none are found locally
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -16,23 +17,30 @@
 #include <tf2/LinearMath/Matrix3x3.h>
 #include <tf2/LinearMath/Vector3.h>
 #include <nav_msgs/msg/odometry.hpp>
+#include <nav_msgs/msg/path.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 
 /**
- * LocalPlannerNode - Frontier-Based Exploration Local Planner
+ * LocalPlannerNode - Frontier-Based Exploration Local Planner with Global Backtracking
  * 
  * This ROS 2 node implements a local planner that:
  * 1. Subscribes to Octomap updates from the mapping system
  * 2. Identifies frontier cells (boundaries between explored and unexplored space)
  * 3. Calculates exploration gain for each frontier
  * 4. Publishes the frontier with highest gain for the trajectory planner to execute
+ * 5. Tracks flight history and backtracks to explore other regions when no local frontiers found
  * 
  * ROS Interface (Subscribers):
  * - /octomap_full (octomap_msgs/Octomap) - 3D occupancy grid from Octomap
+ * - /current_state (nav_msgs/Odometry) - Drone pose and orientation
  * 
  * ROS Interface (Publishers):
  * - /frontier_goal (geometry_msgs/Point) - Best frontier point for exploration
+ * - /backtrack_path (nav_msgs/Path) - Path to backtrack through flown points to nearest unexplored frontier
+ * - /frontier_goal_marker (visualization_msgs/Marker) - Visualization marker for frontier
+ * - /command/trajectory (trajectory_msgs/MultiDOFJointTrajectory) - Trajectory command
  */
 class LocalPlannerNode : public rclcpp::Node
 {
@@ -59,9 +67,12 @@ public:
       std::bind(&LocalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
     
+    last_frontier_found_time_ = this->now();
+    
     RCLCPP_INFO(get_logger(), "Local Planner Node initialized");
     RCLCPP_INFO(get_logger(), "Subscribing to /octomap_full");
     RCLCPP_INFO(get_logger(), "Publishing frontier goals to /frontier_goal");
+    RCLCPP_INFO(get_logger(), "Global Planner handles backtracking when no local frontiers found");
   }
 
 private:
@@ -71,14 +82,27 @@ private:
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
 
+  // Frontier info structure
+  struct FrontierInfo {
+    octomap::point3d position;
+    float exploration_gain;
+    bool visited;
+    int id;
+    
+    FrontierInfo(octomap::point3d pos, float gain, int frontier_id)
+      : position(pos), exploration_gain(gain), visited(false), id(frontier_id) {}
+  };
+
   // Configuration
   const float exploration_radius_ = 5.0;    // Radius around frontier to calculate gain
   const float occupied_threshold_ = 0.5;    // Occupancy probability threshold
-  const float search_radius_ = 20.0;        // Optimization: Search radius increased for larger caves (20m diam)
+  const float search_radius_ = 50.0;        // Optimization: Search radius increased for larger caves (20m diam)
+  const float frontier_proximity_threshold_ = 2.0;  // Distance to consider frontiers as same
 
   // Store latest drone pose and orientation
   geometry_msgs::msg::Point last_drone_position_;
   tf2::Quaternion last_drone_orientation_;
+  rclcpp::Time last_frontier_found_time_;
 
   /**
    * Callback for Octomap subscription
@@ -92,7 +116,7 @@ private:
     octomap::AbstractOcTree* tree = octomap_msgs::msgToMap(*msg);
     octomap::OcTree* octree = dynamic_cast<octomap::OcTree*>(tree);
     
-    RCLCPP_WARN(get_logger(), "Octomap_callback triggered");
+    // RCLCPP_WARN(get_logger(), "Octomap_callback triggered");
 
     // Check for valid octree
     if (!octree) {
@@ -105,12 +129,10 @@ private:
     std::vector<octomap::point3d> frontier_points = get_frontier_points(octree);
     
     if (frontier_points.empty()) {
-      RCLCPP_DEBUG(get_logger(), "No frontier points found in Octomap");
+      RCLCPP_WARN(get_logger(), "No frontier points found locally. Global planner will handle backtracking.");
       delete tree;
       return;
-    }
-    
-    RCLCPP_DEBUG(get_logger(), "Found %lu frontier points", frontier_points.size());
+    }    RCLCPP_DEBUG(get_logger(), "Found %lu frontier points", frontier_points.size());
     
     // 2. Find frontier with highest exploration gain
     
@@ -233,9 +255,16 @@ private:
                 "Published frontier goal: (%.2f, %.2f, %.2f) with gain %.2f",
                 goal_msg.x, goal_msg.y, goal_msg.z, best_gain);
     
+    // Reset timer for local frontier discovery
+    last_frontier_found_time_ = this->now();
+    
     // Cleanup
     delete tree;
   }
+
+  /**
+   * Add frontier to discovered frontiers list, avoiding duplicates
+   */
 
   /**
    * Check if a ray from the drone to the target point is unblocked.
@@ -308,14 +337,13 @@ private:
         }
         
         if (is_frontier && is_safe) {
-          // NEW: Only add frontier if it is visible from the drone
+          // Only add frontier if it is visible from the drone
           if (is_point_visible(octree, leaf_coordinate)) {
              frontiers.push_back(leaf_coordinate);
           }
         }
       }
     }
-    
     return frontiers;
   }
 

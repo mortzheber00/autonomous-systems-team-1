@@ -42,8 +42,19 @@ ament_target_dependencies(local_planner_node
   trajectory_msgs
 )
 
-# Install executable
-install(TARGETS local_planner_node
+# Add global planner node executable
+add_executable(global_planner_node src/global_planner_node.cpp)
+ament_target_dependencies(global_planner_node
+  rclcpp
+  geometry_msgs
+  nav_msgs
+  octomap_msgs
+  octomap
+  visualization_msgs
+)
+
+# Install executables
+install(TARGETS local_planner_node global_planner_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

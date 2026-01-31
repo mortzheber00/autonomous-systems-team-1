@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, ExecuteProcess
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -56,7 +56,7 @@ def generate_launch_description():
         package="simulation",
         executable="Simulation.x86_64",
         name="Simulation",
-        output="screen",
+        output="log",
         parameters=[{'use_sim_time': True}],
     )
 
@@ -180,8 +180,8 @@ def generate_launch_description():
         + [
             unity_launch,
             simulation_node,
-            #state_estimate_corruptor,
-            #state_estimate_corruptor_disabled,
+            state_estimate_corruptor,
+            state_estimate_corruptor_disabled,
             unity_state,
             w_to_unity,
             mapping_launch,
