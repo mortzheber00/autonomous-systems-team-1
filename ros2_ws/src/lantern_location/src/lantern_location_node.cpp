@@ -9,6 +9,9 @@
 #include "sensor_msgs/msg/camera_info.hpp"
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "sensor_msgs/point_cloud2_iterator.hpp"
+#include "geometry_msgs/msg/point_stamped.hpp"
+#include "visualization_msgs/msg/marker.hpp"
+#include "visualization_msgs/msg/marker_array.hpp"
 #include "message_filters/subscriber.h"
 #include "message_filters/time_synchronizer.h"
 #include "message_filters/sync_policies/approximate_time.h"
@@ -21,6 +24,14 @@ namespace lantern_location
 using SyncPolicy = message_filters::sync_policies::ApproximateTime<
   sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
 
+// Structure to track detected lanterns
+struct DetectedLantern
+{
+  geometry_msgs::msg::Point position;  // Average position in camera frame
+  int update_count;                     // Number of times this lantern was updated
+  rclcpp::Time last_seen;              // Last time this lantern was detected
+};
+
 class LanternLocationNode : public rclcpp::Node
 {
 public:
@@ -30,6 +41,14 @@ public:
     // Depth scale parameter (conversion from depth units to meters)
     this->declare_parameter("depth_scale", 0.001);  // mm to meters
     depth_scale_ = this->get_parameter("depth_scale").as_double();
+
+    // Processing frame skip parameter (process every Nth frame)
+    this->declare_parameter("frame_skip", 3);  // Process every 3rd frame by default
+    frame_skip_ = this->get_parameter("frame_skip").as_int();
+
+    // Lantern matching distance threshold (meters)
+    this->declare_parameter("matching_distance_threshold", 5.0);
+    matching_distance_threshold_ = this->get_parameter("matching_distance_threshold").as_double();
 
     // Subscribe to depth camera info to get intrinsics
     depth_info_sub_ = create_subscription<sensor_msgs::msg::CameraInfo>(
@@ -64,6 +83,8 @@ public:
       "/lantern_location/filtered_depth", 10);
     pointcloud_pub_ = create_publisher<sensor_msgs::msg::PointCloud2>(
       "/lantern_location/filtered_pointcloud", 10);
+    lantern_locations_pub_ = create_publisher<visualization_msgs::msg::MarkerArray>(
+      "/lantern_location/detected_lanterns", 10);
 
     // Pre-allocate buffers (will be resized on first use if needed)
     filtered_depth_ = std::make_shared<sensor_msgs::msg::Image>();
@@ -80,6 +101,12 @@ private:
     if (!have_camera_info_) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
         "Waiting for camera info on /realsense/depth/camera_info...");
+      return;
+    }
+
+    // Frame skipping for computational efficiency
+    frame_counter_++;
+    if (frame_counter_ % frame_skip_ != 0) {
       return;
     }
 
@@ -131,8 +158,10 @@ private:
 
     filtered_depth_pub_->publish(*filtered_depth_);
 
-    // Build point cloud (reuse buffers, single pass)
-    publish_pointcloud(filtered_depth_, width, height);
+    // Build point cloud and calculate lantern location
+    calculate_and_publish_lantern_location(filtered_depth_, width, height, 
+                                           depth_msg->header.frame_id, 
+                                           depth_msg->header.stamp);
   }
 
   // Helper to setup point cloud fields (x, y, z as floats)
@@ -167,26 +196,30 @@ private:
     cloud.data.resize(cloud.point_step * width * height);
   }
 
-  void publish_pointcloud(const sensor_msgs::msg::Image::SharedPtr& depth_image,
-                          size_t width, size_t height)
+  void calculate_and_publish_lantern_location(
+      const sensor_msgs::msg::Image::SharedPtr& depth_image,
+      size_t width, size_t height,
+      const std::string& frame_id,
+      const rclcpp::Time& timestamp)
   {
     const size_t num_pixels = width * height;
+    const uint16_t* depth_ptr = reinterpret_cast<const uint16_t*>(depth_image->data.data());
+
+    // Accumulate all valid points to calculate average position
+    double sum_x = 0.0, sum_y = 0.0, sum_z = 0.0;
+    int valid_points = 0;
 
     // Setup point cloud structure (only reallocate if size changed)
-    // Use Quadrotor/DepthCamera which exists in the TF tree
-    // RViz can transform to any frame (e.g., world) using the TF tree
     if (cloud_->width != width || cloud_->height != height) {
-      setup_pointcloud_fields(*cloud_, width, height, "Quadrotor/DepthCamera");
+      setup_pointcloud_fields(*cloud_, width, height, frame_id);
     }
-    cloud_->header.stamp = depth_image->header.stamp;
+    cloud_->header.stamp = timestamp;
+    cloud_->header.frame_id = frame_id;
 
-    // Compute 3D points in camera frame
+    // Compute 3D points in camera frame and accumulate for averaging
     sensor_msgs::PointCloud2Iterator<float> iter_x(*cloud_, "x");
     sensor_msgs::PointCloud2Iterator<float> iter_y(*cloud_, "y");
     sensor_msgs::PointCloud2Iterator<float> iter_z(*cloud_, "z");
-
-    const uint16_t* depth_ptr = reinterpret_cast<const uint16_t*>(depth_image->data.data());
-    int valid_points = 0;
 
     for (size_t i = 0; i < num_pixels; ++i, ++iter_x, ++iter_y, ++iter_z) {
       const uint16_t depth_value = depth_ptr[i];
@@ -205,19 +238,132 @@ private:
         *iter_y = y;
         *iter_z = z;
 
-        // Log first 3 valid points for debugging
-        if (valid_points < 3) {
-          RCLCPP_INFO(get_logger(), "Point %d: pixel(%d,%d) depth=%u -> XYZ(%.3f, %.3f, %.3f)",
-            valid_points, u, v, depth_value, x, y, z);
-        }
+        // Accumulate for average calculation
+        sum_x += x;
+        sum_y += y;
+        sum_z += z;
         ++valid_points;
       }
     }
 
+    // Publish point cloud
     pointcloud_pub_->publish(*cloud_);
 
+    // Calculate and publish lantern location if we have valid points
+    if (valid_points > 0) {
+      geometry_msgs::msg::Point avg_position;
+      avg_position.x = sum_x / valid_points;
+      avg_position.y = sum_y / valid_points;
+      avg_position.z = sum_z / valid_points;
+
+      RCLCPP_INFO(get_logger(), 
+        "Detected lantern at average position: (%.3f, %.3f, %.3f) from %d points",
+        avg_position.x, avg_position.y, avg_position.z, valid_points);
+
+      // Update or add lantern to tracking list
+      update_lantern_list(avg_position, timestamp);
+      
+      // Publish all detected lanterns
+      publish_lantern_locations(frame_id, timestamp);
+    } else {
+      RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
+        "No valid lantern points detected in this frame");
+    }
+  }
+
+  // Update or add a lantern to the tracking list
+  void update_lantern_list(const geometry_msgs::msg::Point& new_position,
+                          const rclcpp::Time& timestamp)
+  {
+    // Check if this lantern matches any existing lantern (within threshold distance)
+    int closest_idx = -1;
+    double min_distance = matching_distance_threshold_;
+
+    for (size_t i = 0; i < detected_lanterns_.size(); ++i) {
+      const auto& lantern = detected_lanterns_[i];
+      double dx = new_position.x - lantern.position.x;
+      double dy = new_position.y - lantern.position.y;
+      double dz = new_position.z - lantern.position.z;
+      double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+
+      if (distance < min_distance) {
+        min_distance = distance;
+        closest_idx = i;
+      }
+    }
+
+    if (closest_idx >= 0) {
+      // Update existing lantern with weighted average
+      auto& lantern = detected_lanterns_[closest_idx];
+      double weight = 1.0 / (lantern.update_count + 1.0);
+      
+      lantern.position.x = lantern.position.x * (1.0 - weight) + new_position.x * weight;
+      lantern.position.y = lantern.position.y * (1.0 - weight) + new_position.y * weight;
+      lantern.position.z = lantern.position.z * (1.0 - weight) + new_position.z * weight;
+      lantern.update_count++;
+      lantern.last_seen = timestamp;
+
+      RCLCPP_INFO(get_logger(), 
+        "Updated lantern #%d at (%.3f, %.3f, %.3f), updates: %d, distance: %.3fm",
+        closest_idx, lantern.position.x, lantern.position.y, lantern.position.z,
+        lantern.update_count, min_distance);
+    } else {
+      // Add new lantern
+      DetectedLantern new_lantern;
+      new_lantern.position = new_position;
+      new_lantern.update_count = 1;
+      new_lantern.last_seen = timestamp;
+      detected_lanterns_.push_back(new_lantern);
+
+      RCLCPP_INFO(get_logger(), 
+        "Added new lantern #%zu at (%.3f, %.3f, %.3f)",
+        detected_lanterns_.size() - 1, 
+        new_position.x, new_position.y, new_position.z);
+    }
+  }
+
+  // Publish all detected lanterns as visual markers
+  void publish_lantern_locations(const std::string& frame_id,
+                                 const rclcpp::Time& timestamp)
+  {
+    visualization_msgs::msg::MarkerArray marker_array;
+
+    for (size_t i = 0; i < detected_lanterns_.size(); ++i) {
+      const auto& lantern = detected_lanterns_[i];
+      
+      visualization_msgs::msg::Marker marker;
+      marker.header.stamp = timestamp;
+      marker.header.frame_id = frame_id;
+      marker.ns = "lanterns";
+      marker.id = i;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+      
+      // Set position
+      marker.pose.position = lantern.position;
+      marker.pose.orientation.w = 1.0;
+      
+      // Set scale (0.3m diameter sphere)
+      marker.scale.x = 0.3;
+      marker.scale.y = 0.3;
+      marker.scale.z = 0.3;
+      
+      // Set color (orange/yellow for lantern, brighter with more updates)
+      float brightness = std::min(1.0f, 0.5f + 0.1f * lantern.update_count);
+      marker.color.r = 1.0;
+      marker.color.g = 0.6 * brightness;
+      marker.color.b = 0.0;
+      marker.color.a = 0.8;  // Slight transparency
+      
+      marker.lifetime = rclcpp::Duration::from_seconds(2.0);
+      
+      marker_array.markers.push_back(marker);
+    }
+
+    lantern_locations_pub_->publish(marker_array);
+    
     RCLCPP_INFO_THROTTLE(get_logger(), *get_clock(), 2000,
-      "Published point cloud: %d valid points / %zu total", valid_points, num_pixels);
+      "Published %zu detected lantern(s)", detected_lanterns_.size());
   }
 
   // Synchronized subscribers
@@ -231,6 +377,7 @@ private:
   // Publishers
   rclcpp::Publisher<sensor_msgs::msg::Image>::SharedPtr filtered_depth_pub_;
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr lantern_locations_pub_;
 
   // Pre-allocated buffers
   sensor_msgs::msg::Image::SharedPtr filtered_depth_;
@@ -243,6 +390,12 @@ private:
   double principal_point_x_ = 0.0;
   double principal_point_y_ = 0.0;
   double depth_scale_ = 0.001;
+
+  // Lantern tracking parameters and state
+  std::vector<DetectedLantern> detected_lanterns_;
+  double matching_distance_threshold_ = 5.0;  // meters
+  int frame_skip_ = 3;  // Process every Nth frame
+  int frame_counter_ = 0;
 };
 
 }  // namespace lantern_location
