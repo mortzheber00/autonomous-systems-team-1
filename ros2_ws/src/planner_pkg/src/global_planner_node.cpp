@@ -66,7 +66,7 @@ public:
     backtrack_path_publisher_ = create_publisher<nav_msgs::msg::Path>("/backtrack_path", 10);
     
     // Create publisher for frontier visualization
-    frontier_markers_publisher_ = create_publisher<visualization_msgs::msg::MarkerArray>("/frontier_markers", 10);
+    frontier_markers_publisher_ = create_publisher<visualization_msgs::msg::MarkerArray>("/global_frontier_markers", 10);
     
     // ----- Subscribers -----
     // Subscribe to frontier goals from local planner to build frontier list

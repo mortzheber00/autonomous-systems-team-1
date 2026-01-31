@@ -1,6 +1,9 @@
 #include <cmath>
 #include <memory>
 #include <string>
+#include <vector>
+#include <limits>
+#include <algorithm>
 
 #include <rclcpp/rclcpp.hpp>
 
@@ -58,6 +61,9 @@ class ControllerNode : public rclcpp::Node {
   Eigen::Vector3d vd;    // desired velocity of the UAV's c.o.m. in the world frame
   Eigen::Vector3d ad;    // desired acceleration of the UAV's c.o.m. in the world frame
   double yawd;           // desired yaw angle
+  
+  // Storage for the full trajectory path (Carrot Following)
+  std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> path_points_;
 
   double hz;             // frequency of the main control loop
 
@@ -136,7 +142,6 @@ public:
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
       //  PART 3 | Objective: fill in xd, vd, ad, yawd
       // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-      // 3.1 Desired position, velocity, and acceleration
       
       if (msg->points.empty()) {
         RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
@@ -144,38 +149,73 @@ public:
         return;
       }
 
-      const auto& des_state_msg = msg->points[0];
+      // Store the full path for the control loop to process (Carrot Following)
+      path_points_ = msg->points;
+  }
+  
+  void updateDesiredStateFromCarrot() {
+      if (path_points_.empty()) return;
 
-      // Safety check: ensure arrays are not empty
-      if (des_state_msg.transforms.empty() || 
-          des_state_msg.velocities.empty() || 
-          des_state_msg.accelerations.empty()) {
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-          "Received incomplete desired_state message (empty arrays)");
-        return;
+      // 1. Find closest point on path to current drone position 'x'
+      double min_dist_sq = std::numeric_limits<double>::max();
+      size_t closest_idx = 0;
+      
+      // Optimization: If path is long, we could search only a window, but full search is safest
+      for (size_t i = 0; i < path_points_.size(); ++i) {
+          const auto& p = path_points_[i];
+          double dx = p.transforms[0].translation.x - x.x();
+          double dy = p.transforms[0].translation.y - x.y();
+          double dz = p.transforms[0].translation.z - x.z();
+          double d_sq = dx*dx + dy*dy + dz*dz;
+           if (d_sq < min_dist_sq) {
+               min_dist_sq = d_sq;
+               closest_idx = i;
+           }
       }
 
-      xd << des_state_msg.transforms[0].translation.x,
-            des_state_msg.transforms[0].translation.y,
-            des_state_msg.transforms[0].translation.z;
+      // 2. Look ahead 5m (or end of path)
+      size_t target_idx = closest_idx;
+      double lookahead = 5.0; 
+      
+      for (size_t i = closest_idx; i < path_points_.size(); ++i) {
+          const auto& p = path_points_[i];
+          double dx = p.transforms[0].translation.x - x.x();
+          double dy = p.transforms[0].translation.y - x.y();
+          double dz = p.transforms[0].translation.z - x.z();
+          double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+          
+          target_idx = i;
+          if (dist >= lookahead) {
+              break;
+          }
+      }
+      
+      const auto& target = path_points_[target_idx];
 
-      vd << des_state_msg.velocities[0].linear.x,
-            des_state_msg.velocities[0].linear.y,
-            des_state_msg.velocities[0].linear.z;
+      // 3. Update Desired State
+      if (!target.transforms.empty()) {
+            xd << target.transforms[0].translation.x,
+                    target.transforms[0].translation.y,
+                    target.transforms[0].translation.z;
+            
+            // Extract yaw
+            auto q = target.transforms[0].rotation;
+            double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
+            double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+            yawd = std::atan2(siny_cosp, cosy_cosp);
+      }
 
-      ad << des_state_msg.accelerations[0].linear.x,
-            des_state_msg.accelerations[0].linear.y,
-            des_state_msg.accelerations[0].linear.z;
+      if (!target.velocities.empty()) {
+            vd << target.velocities[0].linear.x,
+                    target.velocities[0].linear.y,
+                    target.velocities[0].linear.z;
+      }
 
-      //
-      // 3.2 Extract the yaw component from the quaternion in the incoming ROS
-      //     message and store in the yawd class member variable
-
-      // Compute yaw directly from quaternion (avoids tf2 linkage)
-      auto q = des_state_msg.transforms[0].rotation;
-      double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
-      double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
-      yawd = std::atan2(siny_cosp, cosy_cosp);
+      if (!target.accelerations.empty()) {
+            ad << target.accelerations[0].linear.x,
+                    target.accelerations[0].linear.y,
+                    target.accelerations[0].linear.z;
+      }
   }
 
 
@@ -210,6 +250,8 @@ public:
   }
 
   void controlLoop(){
+    updateDesiredStateFromCarrot();
+
     Eigen::Vector3d ex, ev, er, eomega;
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -220,10 +262,27 @@ public:
     ex = x - xd;
     ev = v - vd;
 
+    // Limit Max Velocity (by saturation of position error)
+    // Limits the maximum "pull" towards the goal
+    // Steady state velocity v = -(kx/kv) * ex
+    double max_velocity = 10.0; // m/s
+    double max_ex = max_velocity * kv / kx;
+    if (ex.norm() > max_ex) {
+        ex = ex.normalized() * max_ex;
+    }
+
     // 5.2 Compute the Rd matrix.
 
     // Desired body z-axis (force direction)
-    Eigen::Vector3d force_dir = -kx * ex - kv * ev + m * g * e3 + m * ad;
+    Eigen::Vector3d a_fb = (-kx * ex - kv * ev) / m;
+
+    // Limit Max Acceleration
+    double max_acceleration = 5.0; // m/s^2
+    if (a_fb.norm() > max_acceleration) {
+        a_fb = a_fb.normalized() * max_acceleration;
+    }
+
+    Eigen::Vector3d force_dir = m * a_fb + m * g * e3 + m * ad;
     Eigen::Vector3d b3d = force_dir.normalized();
 
     // Desired yaw direction (projection on xy-plane)

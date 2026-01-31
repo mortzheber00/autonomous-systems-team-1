@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
+import os
 
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
-from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription, ExecuteProcess
+from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition, UnlessCondition
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
@@ -34,6 +36,9 @@ def generate_launch_description():
         DeclareLaunchArgument("depth_info_topic", default_value="realsense/depth/camera_info"),
     ]
 
+    package_dir = get_package_share_directory("simulation")
+    rviz_config_path = os.path.join(package_dir, "config", "visualization.rviz")
+
     # <include file="$(find simulation)/launch/unity_ros.launch"> ...
     # Assumes the included file is also a ROS2 Python launch file named unity_ros.launch.py
     unity_launch = IncludeLaunchDescription(
@@ -56,7 +61,7 @@ def generate_launch_description():
         package="simulation",
         executable="Simulation.x86_64",
         name="Simulation",
-        output="log",
+        output="screen",
         parameters=[{'use_sim_time': True}],
     )
 
@@ -115,6 +120,15 @@ def generate_launch_description():
         output="screen",
         parameters=[{'use_sim_time': True}],
         remappings=[('current_state', 'current_state')] #remap controllers input to /current_state_est
+    )
+
+    rviz_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz2",
+        output="screen",
+        parameters=[{"use_sim_time": True}],
+        arguments=["-d", rviz_config_path],
     )
 
     mapping_launch = IncludeLaunchDescription(
@@ -180,12 +194,13 @@ def generate_launch_description():
         + [
             unity_launch,
             simulation_node,
-            state_estimate_corruptor,
-            state_estimate_corruptor_disabled,
+            #state_estimate_corruptor,
+            #state_estimate_corruptor_disabled,
             unity_state,
             w_to_unity,
             mapping_launch,
             controller_node,
+            rviz_node,
             *static_tf_nodes,
         ]
     )
