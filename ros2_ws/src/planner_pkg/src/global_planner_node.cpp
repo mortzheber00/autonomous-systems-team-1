@@ -75,6 +75,12 @@ public:
       std::bind(&GlobalPlannerNode::frontier_callback, this, std::placeholders::_1)
     );
     
+    // Subscribe to frontier candidates from local planner for global frontier list
+    frontier_candidates_subscription_ = create_subscription<nav_msgs::msg::Path>(
+      "/frontier_candidates", 10,
+      std::bind(&GlobalPlannerNode::frontier_candidates_callback, this, std::placeholders::_1)
+    );
+    
     // Subscribe to Octomap for exploration gain calculation
     octomap_subscription_ = create_subscription<octomap_msgs::msg::Octomap>(
       "/octomap_full", 10,
@@ -99,6 +105,12 @@ public:
       std::bind(&GlobalPlannerNode::publish_frontier_markers, this)
     );
     
+    // Create timer for periodic frontier pruning (every 5 seconds)
+    prune_timer_ = create_wall_timer(
+      std::chrono::milliseconds(5000),
+      std::bind(&GlobalPlannerNode::periodic_prune, this)
+    );
+    
     RCLCPP_INFO(get_logger(), "Global Planner Node initialized");
     RCLCPP_INFO(get_logger(), "Maintaining sparse frontier set with periodic pruning");
     RCLCPP_INFO(get_logger(), "Frontiers added: 5 -> Prune low-gain frontiers and re-evaluate gains");
@@ -111,12 +123,14 @@ private:
   
   // Subscribers
   rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr frontier_subscription_;
+  rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr frontier_candidates_subscription_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
   
   // Timers
   rclcpp::TimerBase::SharedPtr planning_timer_;
   rclcpp::TimerBase::SharedPtr viz_timer_;
+  rclcpp::TimerBase::SharedPtr prune_timer_;
   
   // Octomap storage
   std::shared_ptr<octomap::OcTree> octree_;
@@ -171,6 +185,44 @@ private:
       } else {
         RCLCPP_WARN(get_logger(), "Frontier list at maximum size (%lu), skipping new frontier at (%.2f, %.2f, %.2f)", 
                     frontier_list_.size(), msg->x, msg->y, msg->z);
+      }
+    }
+  }
+
+  /**
+   * Callback for frontier candidates from local planner
+   * 
+   * Receives a set of frontier candidates and adds them to the global frontier list.
+   * This provides a richer set of frontier options for global planning.
+   */
+  void frontier_candidates_callback(const nav_msgs::msg::Path::SharedPtr msg)
+  {
+    if (msg->poses.empty()) {
+      return;
+    }
+    
+    RCLCPP_DEBUG(get_logger(), "Received %lu frontier candidates from local planner", msg->poses.size());
+    
+    for (const auto& pose : msg->poses) {
+      geometry_msgs::msg::Point candidate_point = pose.pose.position;
+      
+      // Check if this candidate is already in the list
+      auto existing = find_nearby_frontier(candidate_point);
+      
+      if (existing == frontier_list_.end()) {
+        // New candidate - add it if under limit
+        if (frontier_list_.size() < max_frontiers_) {
+          frontier_list_.emplace_back(candidate_point, 0.5, frontier_counter_++);
+          frontier_added_since_prune_++;
+          
+          // After every N new frontiers, re-evaluate gains and prune
+          if (frontier_added_since_prune_ >= prune_interval_) {
+            RCLCPP_INFO(get_logger(), "[PRUNE] Reached interval (%d frontiers added). Re-evaluating gains and pruning...",
+                        frontier_added_since_prune_);
+            prune_low_gain_frontiers();
+            frontier_added_since_prune_ = 0;
+          }
+        }
       }
     }
   }
@@ -251,6 +303,22 @@ private:
     } else if (flown_points_.empty()) {
       RCLCPP_WARN(get_logger(), "[GLOBAL] No flown points recorded yet. Frontiers: %lu", frontier_list_.size());
     }
+  }
+
+  /**
+   * Periodic pruning - called by timer every 5 seconds
+   * 
+   * Ensures frontier list stays pruned even if no new frontiers are being added.
+   * This prevents stale or low-gain frontiers from accumulating.
+   */
+  void periodic_prune()
+  {
+    if (frontier_list_.empty()) {
+      return;
+    }
+    
+    RCLCPP_DEBUG(get_logger(), "Periodic frontier pruning triggered. Current list size: %lu", frontier_list_.size());
+    prune_low_gain_frontiers();
   }
 
   /**
