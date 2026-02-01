@@ -33,10 +33,10 @@
 
 /**
  * LocalPlannerNode - Frontier-Based Exploration Local Planner
- * * IMPROVEMENTS:
- * 1. Decoupled Planning from Mapping: Uses a 2Hz timer for planning instead of reacting to every map update.
- * 2. Goal Commitment: Stick to a goal until reached (tolerance) or blocked. Prevents twitching.
- * 3. Constant Trajectory Publishing: Keeps the controller happy even when not changing goals.
+ * Key improvements:
+ * 1. Goal Commitment: Stick to a goal until reached or blocked.
+ * 2. Constant Trajectory Publishing: Keeps controller active.
+ * 3. Frontier-based exploration with global planner backtracking.
  */
 class LocalPlannerNode : public rclcpp::Node
 {
@@ -65,8 +65,6 @@ public:
       "/current_state", 10,
       std::bind(&LocalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
-    
-    last_frontier_found_time_ = this->now();
 
     // Timer: Run planning loop at 5 Hz (200ms)
     // This stabilizes the behavior by not replanning on every single map voxel change.
@@ -79,8 +77,7 @@ public:
     goal_active_ = false;
     current_octree_ = nullptr;
 
-    RCLCPP_INFO(get_logger(), "Local Planner Node initialized with Stabilized Loop (2Hz)");
-    RCLCPP_INFO(get_logger(), "Global Planner handles backtracking when no local frontiers found");
+    RCLCPP_INFO(get_logger(), "Local Planner Node initialized");
   }
 
 private:
@@ -99,13 +96,9 @@ private:
   std::shared_ptr<octomap::OcTree> current_octree_;
   geometry_msgs::msg::Point last_drone_position_;
   tf2::Quaternion last_drone_orientation_;
-    rclcpp::Time last_frontier_found_time_;
   
   // Moving average of drone movement direction
   std::vector<tf2::Vector3> movement_history_; 
-  // Track repeated frontiers for backtracking detection
-  octomap::point3d last_frontier_point_;
-  int repeated_frontier_count_ = 0;  // Counter for consecutive times same frontier is selected
   
   // Store frontier candidates for global planner
   std::vector<octomap::point3d> last_frontier_candidates_;
@@ -115,31 +108,18 @@ private:
   bool goal_active_;
   geometry_msgs::msg::Point current_goal_;
 
-  // Frontier info structure
-  struct FrontierInfo {
-    octomap::point3d position;
-    float exploration_gain;
-    bool visited;
-    int id;
-    
-    FrontierInfo(octomap::point3d pos, float gain, int frontier_id)
-      : position(pos), exploration_gain(gain), visited(false), id(frontier_id) {}
-  };
-
   // Configuration
   const float exploration_radius_scale = 4.0;       // Radius around frontier to calculate gain
   const float occupied_threshold_ = 0.5;            // Occupancy probability threshold
-  const float search_radius_ = 200.0;                // Search radius
+  const float search_radius_ = 80.0;                // Search radius
   const float exploration_weight_ = 2.0;            // Weight for exploration gain
   const float direction_weight_ = 1.0;              // Weight for direction gain
   const float x_limit_position_ = -370.0;           // Cave boundary limit
-  const float frontier_proximity_threshold_ = 2.0;  // Distance to consider frontiers as same
   const size_t movement_history_size_ = 10;         // Number of movement samples for moving average
-  const float safety_radius_ = 8.0;                 // Safety radius for obstacle penalty
-  const float frontier_safety_radius_ = 2.0;        // Clearance radius around frontier - no obstacles allowed
+  const float frontier_safety_radius_ = 1.0;        // Clearance radius around frontier - reduced from 2.0 to be less restrictive
   
   // Stability Parameters
-  const double goal_reached_tolerance_ = 30.0;      // Meters. Drone is "close enough" to switch goals
+  const double goal_reached_tolerance_ = 20.0;      // Meters. Drone is "close enough" to switch goals
   
   // ---------------------------------------------------------------------------
   // Callbacks
@@ -238,8 +218,6 @@ private:
             goal_active_ = true;
             RCLCPP_INFO(get_logger(), "New Frontier Selected: [%.1f, %.1f, %.1f, Gain: %.2f]", 
                         new_goal.x, new_goal.y, new_goal.z, best_gain);
-            // Reset timer for local frontier discovery
-            last_frontier_found_time_ = this->now();
         } else {
             RCLCPP_WARN(get_logger(), "No valid frontiers found. Holding position.");
             goal_active_ = false;
@@ -268,7 +246,7 @@ private:
     
     // If no frontiers found or the frontier is the same 10 times in a row, check if we can backtrack
     // ToDo: Communication with global planner for backtracking
-    if (frontier_points.empty() || repeated_frontier_count_ >= 10) {
+    if (frontier_points.empty()) {
       RCLCPP_WARN(get_logger(), "No frontier points found locally. Global planner will handle backtracking.");
     }
     RCLCPP_DEBUG(get_logger(), "Found %lu frontier points", frontier_points.size());
@@ -299,6 +277,14 @@ private:
     }
 
     // 4. Score points
+    if (points_to_evaluate.empty()) {
+      RCLCPP_WARN(get_logger(), "No points to evaluate after filtering");
+      result_point.x = 0;
+      result_point.y = 0;
+      result_point.z = 0;
+      return -1.0;
+    }
+    
     octomap::point3d best_point = points_to_evaluate[0];
     float best_gain = -1.0;
     
@@ -308,6 +294,13 @@ private:
       float direction_gain = calculate_direction_gain(point);
       
       float total_gain = exploration_weight_ * exploration_gain + direction_weight_ * direction_gain;
+      
+      // Debug logging for direction gain analysis
+      if (total_gain > best_gain * 0.9) {  // Log top candidates
+        RCLCPP_INFO(get_logger(), 
+          "Frontier: pos(%.1f,%.1f,%.1f) exp_gain=%.3f dir_gain=%.3f total=%.3f (hist_size=%lu)",
+          point.x(), point.y(), point.z(), exploration_gain, direction_gain, total_gain, movement_history_.size());
+      }
       
       if (total_gain > best_gain) {
         best_gain = total_gain;
@@ -371,9 +364,9 @@ private:
           }
         }
         
-        // Only accept frontiers that face mostly toward unknown space
-        // Require at least 2 unknown neighbors and fewer occupied neighbors than unknown
-        if (is_frontier && unknown_neighbors >= 2 && unknown_neighbors > occupied_neighbors) {
+        // Accept frontiers with at least 1 unknown neighbor (more permissive)
+        // This allows finding frontiers in more situations
+        if (is_frontier && unknown_neighbors >= 1) {
           is_safe = true;
         } else {
           is_safe = false;
@@ -411,70 +404,77 @@ private:
 
   bool is_frontier_safe_clearance(octomap::OcTree* octree, const octomap::point3d& frontier_point)
   {
-    // Check that no occupied voxels exist within frontier_safety_radius_
-    float check_step = 1.0f;  // Check every 1 meter
+    // Check that no occupied voxels exist too close to frontier
+    // Use a smaller checking radius and fewer samples to be more permissive
+    float check_step = 0.5f;  // Check every 0.5 meter
+    int occupied_count = 0;
+    int total_checks = 0;
     
     for (float dx = -frontier_safety_radius_; dx <= frontier_safety_radius_; dx += check_step) {
       for (float dy = -frontier_safety_radius_; dy <= frontier_safety_radius_; dy += check_step) {
         for (float dz = -frontier_safety_radius_; dz <= frontier_safety_radius_; dz += check_step) {
           octomap::point3d check_point = frontier_point + octomap::point3d(dx, dy, dz);
           octomap::OcTreeNode* node = octree->search(check_point);
+          total_checks++;
           
-          // If an occupied node exists in this radius, frontier is not safe
           if (node && octree->isNodeOccupied(node)) {
-            return false;
+            occupied_count++;
           }
         }
       }
     }
     
-    return true;  // No obstacles in clearance radius
+    // Allow frontier if less than 30% of the surrounding space is occupied
+    // This is more permissive than requiring ZERO obstacles
+    float occupancy_ratio = static_cast<float>(occupied_count) / static_cast<float>(total_checks);
+    return occupancy_ratio < 0.3f;  // Allow some obstacles nearby
   }
 
   float calculate_exploration_gain(octomap::OcTree* octree, const octomap::point3d& point, float radius)
   {
     int unknown_voxels = 0;
+    int occupied_voxels = 0;
     int total_voxels = 0;
     float voxel_size = octree->getResolution();
     float step_size = (voxel_size > 0.4f) ? voxel_size : 0.4f; // Optimization: Larger steps
     
     // 1. Calculate Standard Exploration Gain
+    // Count unknown voxels (no node found = unobserved space) and occupied voxels
     for (float dx = -radius; dx <= radius; dx += step_size) {
       for (float dy = -radius; dy <= radius; dy += step_size) {
         for (float dz = -radius; dz <= radius; dz += step_size) {
           octomap::point3d search_point = point + octomap::point3d(dx, dy, dz);
           total_voxels++;
-          if (!octree->search(search_point)) {
+          
+          octomap::OcTreeNode* node = octree->search(search_point);
+          // If no node found at this point, it's unknown/unobserved
+          if (!node) {
             unknown_voxels++;
+          } else if (octree->isNodeOccupied(node)) {
+            occupied_voxels++;
           }
         }
       }
     }
 
-    if (total_voxels == 0) return 0.0;
-    float volume_gain = static_cast<float>(unknown_voxels) / static_cast<float>(total_voxels);
-
-    // 2. Safety Penalty
-    bool near_obstacle = false;
+    if (total_voxels == 0) return 0.0f;
     
-    double check_dirs[6][3] = {
-        {safety_radius_, 0, 0}, {-safety_radius_, 0, 0},
-        {0, safety_radius_, 0}, {0, -safety_radius_, 0},
-        {0, 0, safety_radius_}, {0, 0, -safety_radius_}
-    };
-
-    for (auto& dir : check_dirs) {
-        octomap::point3d check_p = point + octomap::point3d(dir[0], dir[1], dir[2]);
-        octomap::OcTreeNode* node = octree->search(check_p);
-        if (node && octree->isNodeOccupied(node)) {
-            near_obstacle = true;
-            break; 
-        }
+    float volume_gain = static_cast<float>(unknown_voxels) / static_cast<float>(total_voxels);
+    
+    // 2. Calculate wall proximity penalty
+    // Frontiers surrounded by many obstacles should be penalized
+    // This discourages selecting frontiers that lead into tight spaces
+    float occupancy_ratio = static_cast<float>(occupied_voxels) / static_cast<float>(total_voxels);
+    
+    // Wall penalty: if >40% of radius is occupied, reduce gain
+    float wall_penalty = 1.0f;
+    if (occupancy_ratio > 0.4f) {
+      // Penalty increases with occupancy: at 40% occupied = 1.0x gain, at 70% = 0.3x gain
+      wall_penalty = std::max(0.3f, 1.0f - (occupancy_ratio - 0.4f) * 2.33f);
     }
-
-    if (near_obstacle) {
-        return volume_gain * 0.1; 
-    }
+    
+    // Clamp to [0, 1]
+    volume_gain = std::min(1.0f, volume_gain * wall_penalty);
 
     return volume_gain;
   }
@@ -482,63 +482,50 @@ private:
   /**
    * Calculate direction gain based on drone movement history (moving average)
    * 
-   * Instead of just using camera heading, this calculates gain based on the
-   * drone's overall movement direction over the last N samples (moving average).
-   * This biases frontier selection toward where the drone has been heading,
-   * making exploration more coherent and continuous.
-   * 
-   * Returns [0, 1] where 1.0 = perfectly aligned with movement direction, 0.0 = opposite
+   * Biases frontier selection toward where the drone has been heading.
+   * Returns [0, 1] where 1.0 = perfectly aligned, 0.0 = opposite direction
    */
   float calculate_direction_gain(const octomap::point3d& frontier_point)
   {
-    // If we don't have enough movement history, fall back to camera heading
-    if (movement_history_.size() < 2) {
-      tf2::Vector3 cam_forward_body(1, 0, 0);
-      tf2::Vector3 cam_forward_world = tf2::quatRotate(last_drone_orientation_, cam_forward_body);
+    // Use average movement direction if available
+    tf2::Vector3 reference_direction(0, 0, 0);
+    bool has_valid_movement = false;
+    
+    if (movement_history_.size() >= 3) {
+      // Calculate average movement direction from history (only if we have substantial history)
+      for (const auto& movement : movement_history_) {
+        reference_direction += movement;
+      }
+      reference_direction /= movement_history_.size();
       
-      tf2::Vector3 drone_pos(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
-      tf2::Vector3 frontier_vec(frontier_point.x() - drone_pos.x(),
-                                frontier_point.y() - drone_pos.y(),
-                                frontier_point.z() - drone_pos.z());
-      if (frontier_vec.length() == 0) return 0.0f;
-      frontier_vec.normalize();
-      cam_forward_world.normalize();
-      
-      double dot = cam_forward_world.dot(frontier_vec);
-      dot = std::clamp(dot, -1.0, 1.0);
-      float gain = static_cast<float>(cos(acos(dot)));
-      return (gain + 1.0f) / 2.0f;
+      if (reference_direction.length() > 0.1f) {
+        reference_direction.normalize();
+        has_valid_movement = true;
+      }
     }
     
-    // Calculate average movement direction from history
-    tf2::Vector3 avg_movement(0, 0, 0);
-    for (const auto& movement : movement_history_) {
-      avg_movement += movement;
+    // If hovering or insufficient movement, return neutral gain (don't bias)
+    if (!has_valid_movement) {
+      return 0.5f;  // Neutral gain - let exploration gain dominate
     }
-    avg_movement /= movement_history_.size();
-    
-    if (avg_movement.length() < 0.01f) {
-      // Drone hasn't moved much, return neutral gain
-      return 0.5f;
-    }
-    avg_movement.normalize();
 
+    // Calculate frontier direction from drone
     tf2::Vector3 drone_pos(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
     tf2::Vector3 frontier_vec(frontier_point.x() - drone_pos.x(),
                               frontier_point.y() - drone_pos.y(),
                               frontier_point.z() - drone_pos.z());
     
-    if (frontier_vec.length() == 0) return 0.0f;
+    if (frontier_vec.length() == 0) return 0.5f;
     frontier_vec.normalize();
 
-// Compute angle between average movement direction and frontier direction
-    double dot = avg_movement.dot(frontier_vec);
+    // Compute dot product: 1 = same direction, -1 = opposite, 0 = perpendicular
+    double dot = reference_direction.dot(frontier_vec);
     dot = std::clamp(dot, -1.0, 1.0);
-    double angle = acos(dot);
-
-    // Normalize: 1.0 if perfectly aligned, 0.0 if opposite
-    float gain = static_cast<float>(cos(angle));
-    gain = (gain + 1.0f) / 2.0f;
+    
+    // Map [-1, 1] to [0.2, 1.0]: opposite gets 0.2 (still possible), aligned gets 1.0
+    // This allows exploration in ANY direction while slightly preferring forward motion
+    float gain = static_cast<float>(0.2 + (dot + 1.0) * 0.4);
+    
     return gain;
   }
 
