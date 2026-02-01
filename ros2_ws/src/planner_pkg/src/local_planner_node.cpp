@@ -30,6 +30,7 @@
 #include <cmath>
 #include <memory>
 #include <algorithm>
+#include <limits>
 
 /**
  * LocalPlannerNode - Frontier-Based Exploration Local Planner
@@ -37,7 +38,22 @@
  * 1. Goal Commitment: Stick to a goal until reached or blocked.
  * 2. Constant Trajectory Publishing: Keeps controller active.
  * 3. Frontier-based exploration with global planner backtracking.
+ * 4. Maintains frontier buffer and selects mean frontier point.
  */
+
+// Structure to hold frontier candidate data
+struct FrontierCandidate {
+  octomap::point3d position;
+  float exploration_gain;
+  float direction_gain;
+  float total_gain;
+  
+  // Comparison operator for sorting (highest gain first)
+  bool operator<(const FrontierCandidate& other) const {
+    return total_gain > other.total_gain;  // Descending order
+  }
+};
+
 class LocalPlannerNode : public rclcpp::Node
 {
 public:
@@ -66,16 +82,17 @@ public:
       std::bind(&LocalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
 
-    // Timer: Run planning loop at 5 Hz (200ms)
+    // Timer: Run planning loop at 20 Hz (200ms)
     // This stabilizes the behavior by not replanning on every single map voxel change.
     planning_timer_ = create_wall_timer(
-        std::chrono::milliseconds(200),
+        std::chrono::milliseconds(50),
         std::bind(&LocalPlannerNode::planning_loop, this)
     );
     
     // Initialize State
     goal_active_ = false;
     current_octree_ = nullptr;
+    octomap_just_updated_ = false;
 
     RCLCPP_INFO(get_logger(), "Local Planner Node initialized");
   }
@@ -102,6 +119,10 @@ private:
   
   // Store frontier candidates for global planner
   std::vector<octomap::point3d> last_frontier_candidates_;
+  
+  // Frontier buffering between octomap updates
+  std::vector<std::vector<FrontierCandidate>> frontier_buffer_;  // Buffer of frontier sets between updates
+  bool octomap_just_updated_;  // Flag to detect new octomap updates
 
 
   // State Machine for Goal Persistence
@@ -163,6 +184,8 @@ private:
         octomap::OcTree* octree = dynamic_cast<octomap::OcTree*>(tree);
         if (octree) {
             current_octree_ = std::shared_ptr<octomap::OcTree>(octree);
+            octomap_just_updated_ = true;  // Flag that we have a new octomap
+            frontier_buffer_.clear();  // Clear buffer on new octomap
         } else {
             RCLCPP_ERROR(get_logger(), "Octomap message was not an OcTree");
             delete tree;
@@ -199,7 +222,7 @@ private:
         // Condition B: Blocked?
         else {
             octomap::point3d goal_pt(current_goal_.x, current_goal_.y, current_goal_.z);
-            if (!is_point_visible(current_octree_.get(), goal_pt)) {
+            if (!is_frontier_reachable(current_octree_.get(), goal_pt)) {
                  RCLCPP_WARN(get_logger(), "Current goal path obstructed. Replanning.");
                  need_new_goal = true;
             }
@@ -276,7 +299,7 @@ private:
       points_to_evaluate = candidates;
     }
 
-    // 4. Score points
+    // 4. Score points and buffer results
     if (points_to_evaluate.empty()) {
       RCLCPP_WARN(get_logger(), "No points to evaluate after filtering");
       result_point.x = 0;
@@ -285,9 +308,8 @@ private:
       return -1.0;
     }
     
-    octomap::point3d best_point = points_to_evaluate[0];
-    float best_gain = -1.0;
-    
+    // Score all points
+    std::vector<FrontierCandidate> current_frontiers;
     for (const auto& point : points_to_evaluate) {
       double point_size = current_octree_->getNodeSize(current_octree_->getTreeDepth());
       float exploration_gain = calculate_exploration_gain(current_octree_.get(), point, exploration_radius_scale * point_size);
@@ -295,24 +317,74 @@ private:
       
       float total_gain = exploration_weight_ * exploration_gain + direction_weight_ * direction_gain;
       
-      // Debug logging for direction gain analysis
-      if (total_gain > best_gain * 0.9) {  // Log top candidates
-        RCLCPP_INFO(get_logger(), 
-          "Frontier: pos(%.1f,%.1f,%.1f) exp_gain=%.3f dir_gain=%.3f total=%.3f (hist_size=%lu)",
-          point.x(), point.y(), point.z(), exploration_gain, direction_gain, total_gain, movement_history_.size());
+      FrontierCandidate candidate;
+      candidate.position = point;
+      candidate.exploration_gain = exploration_gain;
+      candidate.direction_gain = direction_gain;
+      candidate.total_gain = total_gain;
+      
+      current_frontiers.push_back(candidate);
+    }
+    
+    // Add to buffer
+    frontier_buffer_.push_back(current_frontiers);
+    
+    // If octomap just updated, compute mean frontier from buffer
+    octomap::point3d mean_frontier;
+    if (octomap_just_updated_ && !frontier_buffer_.empty()) {
+      // Flatten all frontier candidates from buffer
+      std::vector<FrontierCandidate> all_buffered;
+      for (const auto& frontier_set : frontier_buffer_) {
+        for (const auto& candidate : frontier_set) {
+          all_buffered.push_back(candidate);
+        }
       }
       
-      if (total_gain > best_gain) {
-        best_gain = total_gain;
-        best_point = point;
+      // Find the frontier closest to all others (minimum sum of distances)
+      if (!all_buffered.empty()) {
+        float min_total_distance = std::numeric_limits<float>::max();
+        size_t best_idx = 0;
+        
+        for (size_t i = 0; i < all_buffered.size(); ++i) {
+          float total_distance = 0.0f;
+          for (size_t j = 0; j < all_buffered.size(); ++j) {
+            if (i != j) {
+              total_distance += all_buffered[i].position.distance(all_buffered[j].position);
+            }
+          }
+          
+          if (total_distance < min_total_distance) {
+            min_total_distance = total_distance;
+            best_idx = i;
+          }
+        }
+        
+        mean_frontier = all_buffered[best_idx].position;
+        RCLCPP_INFO(get_logger(), 
+          "Using mean frontier from %lu buffered sets. Position: (%.1f, %.1f, %.1f), Total distance to others: %.1f",
+          frontier_buffer_.size(), mean_frontier.x(), mean_frontier.y(), mean_frontier.z(), min_total_distance);
+        
+        octomap_just_updated_ = false;
       }
+    } else {
+      // Use best from current set if no buffered mean available
+      float best_gain = -1.0f;
+      octomap::point3d best_point = current_frontiers[0].position;
+      
+      for (const auto& candidate : current_frontiers) {
+        if (candidate.total_gain > best_gain) {
+          best_gain = candidate.total_gain;
+          best_point = candidate.position;
+        }
+      }
+      mean_frontier = best_point;
     }
 
-    result_point.x = best_point.x();
-    result_point.y = best_point.y();
-    result_point.z = best_point.z();
+    result_point.x = mean_frontier.x();
+    result_point.y = mean_frontier.y();
+    result_point.z = mean_frontier.z();
 
-    return best_gain;
+    return 1.0f;  // Return positive gain since we found a frontier
   }
 
   std::vector<octomap::point3d> get_frontier_points(octomap::OcTree* octree)
@@ -320,9 +392,13 @@ private:
     std::vector<octomap::point3d> frontiers;
     octomap::point3d drone_position(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
     
-    // Iterate through ALL octree nodes (all depths), not just leaves
-    // This ensures we find frontiers at multiple resolutions
-    for (auto it = octree->begin(octree->getTreeDepth()); it != octree->end(); ++it) {
+    // Use smallest voxel size (finest resolution) for all neighbor checks
+    // This ensures all frontiers are evaluated uniformly, preventing attraction to fine-resolution voxels near walls
+    double finest_voxel_size = octree->getNodeSize(octree->getTreeDepth());
+    
+    // Iterate through ALL octree nodes at ALL depths (coarse to fine)
+    // Start from depth 0 (root) to get frontiers at all resolutions
+    for (auto it = octree->begin(0); it != octree->end(); ++it) {
       // Optimization: Bounding box check first
       if (it.getCoordinate().distance(drone_position) > search_radius_) {
         continue;
@@ -331,16 +407,18 @@ private:
       // Only consider free cells
       if (it->getOccupancy() < occupied_threshold_) {
         double size = octree->getNodeSize(it.getDepth());
+        // Skip nodes much larger than finest resolution to avoid coarse approximations
+        // Keep nodes from 4m and up (skip only the 2m finest resolution)
         if (size < 4.0) {
-          continue; // Skip large nodes for frontier detection
+          continue;  // Skip nodes smaller than 4m (including 2m finest)
         }
         octomap::point3d node_coordinate = it.getCoordinate();
         
-        // Check 6 direct neighbors
+        // Check 6 direct neighbors using finest resolution
         double directions[6][3] = {
-          {size, 0, 0}, {-size, 0, 0},
-          {0, size, 0}, {0, -size, 0},
-          {0, 0, size}, {0, 0, -size}
+          {finest_voxel_size, 0, 0}, {-finest_voxel_size, 0, 0},
+          {0, finest_voxel_size, 0}, {0, -finest_voxel_size, 0},
+          {0, 0, finest_voxel_size}, {0, 0, -finest_voxel_size}
         };
         
         bool is_frontier = false;
@@ -373,8 +451,8 @@ private:
         }
         
         if (is_frontier && is_safe) {
-          // Check visibility from drone to prevent selecting unreachable points
-          if (is_point_visible(octree, node_coordinate)) {
+          // Check reachability: the frontier point itself should be in free space (not occupied)
+          if (is_frontier_reachable(octree, node_coordinate)) {
              // Check that no obstacles are too close to this frontier
              if (is_frontier_safe_clearance(octree, node_coordinate)) {
                frontiers.push_back(node_coordinate);
@@ -386,20 +464,24 @@ private:
     return frontiers;
   }
 
-  bool is_point_visible(octomap::OcTree* octree, const octomap::point3d& target)
+  bool is_frontier_reachable(octomap::OcTree* octree, const octomap::point3d& target)
   {
-    octomap::point3d drone_pos(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
+    // Check if the frontier point itself is in free space (reachable)
+    // This allows exploring around corners, not just visible frontiers
+    octomap::OcTreeNode* target_node = octree->search(target);
     
-    octomap::point3d direction = target - drone_pos;
-    double length = direction.norm();
-
-    if (length < 0.1) return true;
-
-    octomap::point3d end_point;
-    // castRay: true = ignore unknown (treat as free). Returns true if obstacle HIT.
-    bool hit_obstacle = octree->castRay(drone_pos, direction, end_point, true, length);
+    // If no node exists at target, it's unknown - assume reachable
+    if (!target_node) {
+      return true;
+    }
     
-    return !hit_obstacle;
+    // If node exists but is occupied, not reachable
+    if (octree->isNodeOccupied(target_node)) {
+      return false;
+    }
+    
+    // Node is free - reachable
+    return true;
   }
 
   bool is_frontier_safe_clearance(octomap::OcTree* octree, const octomap::point3d& frontier_point)
@@ -466,11 +548,12 @@ private:
     // This discourages selecting frontiers that lead into tight spaces
     float occupancy_ratio = static_cast<float>(occupied_voxels) / static_cast<float>(total_voxels);
     
-    // Wall penalty: if >40% of radius is occupied, reduce gain
+    // Wall penalty: if >40% of radius is occupied, reduce gain significantly
     float wall_penalty = 1.0f;
     if (occupancy_ratio > 0.4f) {
-      // Penalty increases with occupancy: at 40% occupied = 1.0x gain, at 70% = 0.3x gain
-      wall_penalty = std::max(0.3f, 1.0f - (occupancy_ratio - 0.4f) * 2.33f);
+      // Penalty increases with occupancy: at 40% = 1.0x gain, at 60% = 0.0x gain
+      // This strongly discourages tight spaces
+      wall_penalty = std::max(0.0f, 1.0f - (occupancy_ratio - 0.4f) * 5.0f);
     }
     
     // Clamp to [0, 1]
