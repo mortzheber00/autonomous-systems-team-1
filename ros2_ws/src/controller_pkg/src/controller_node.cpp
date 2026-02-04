@@ -9,7 +9,6 @@
 
 #include <mav_msgs/msg/actuators.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <trajectory_msgs/msg/multi_dof_joint_trajectory_point.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 
 #include <Eigen/Dense>
@@ -23,8 +22,7 @@ class ControllerNode : public rclcpp::Node {
   //  PART 1 |  Declare ROS callback handlers
 
   // Subscribers
-  rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint>::SharedPtr desired_state_subscriber_;
-  rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr trajectory_subscriber_;
+  rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr desired_state_subscriber_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr current_state_subscriber_;
 
   // Publisher (propeller speeds)
@@ -32,12 +30,6 @@ class ControllerNode : public rclcpp::Node {
 
   // Timer for main control loop
   rclcpp::TimerBase::SharedPtr control_loop_timer_;
-  
-  // Trajectory tracking
-  std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> trajectory_points_;
-  size_t current_trajectory_index_;
-  bool trajectory_active_;
-  rclcpp::Time trajectory_start_time_;
 
 
   // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
@@ -95,9 +87,7 @@ public:
     xd(-38,10,9),
     vd(0,0,0),
     ad(0,0,0),
-    yawd(0),
-    current_trajectory_index_(0),
-    trajectory_active_(false)
+    yawd(0)
   {
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     //  PART 2 |  Initialize ROS callback handlers
@@ -107,11 +97,6 @@ public:
     desired_state_subscriber_ = this->create_subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>(
         "/command/trajectory", 10,
         std::bind(&ControllerNode::onDesiredState, this, std::placeholders::_1));
-
-    // bind controllerNode::onTrajectory() to the topic "command/trajectory"
-    trajectory_subscriber_ = this->create_subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>(
-        "/command/trajectory", 10,
-        std::bind(&ControllerNode::onTrajectory, this, std::placeholders::_1));
 
     // bind controllerNode::onCurrentState() to the topic "current_state"
     current_state_subscriber_ = this->create_subscription<nav_msgs::msg::Odometry>(
@@ -135,10 +120,10 @@ public:
     //  PART 6 [NOTE: save this for last] |  Tune your gains!
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Controller gains 
-    kx = 3.0; // default 3.0
-    kv = 3.5; // default 3.6
+    kx = 3.0;
+    kv = 3.6;
     kr = 10.0;
-    komega = 1.8;
+    komega = 2.0;
 
     // Initialize constants
     m = 1.0;
@@ -220,31 +205,17 @@ public:
             yawd = std::atan2(siny_cosp, cosy_cosp);
       }
 
-      // Compute yaw directly from quaternion (avoids tf2 linkage)
-      auto q = des_state_msg->transforms[0].rotation;
-      double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
-      double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
-      yawd = std::atan2(siny_cosp, cosy_cosp);
-      
-      // Disable trajectory mode when receiving manual commands
-      trajectory_active_ = false;
-  }
-
-  void onTrajectory(const trajectory_msgs::msg::MultiDOFJointTrajectory::SharedPtr traj_msg){
-      if (traj_msg->points.empty()) {
-        RCLCPP_WARN(this->get_logger(), "Received empty trajectory");
-        return;
+      if (!target.velocities.empty()) {
+            vd << target.velocities[0].linear.x,
+                    target.velocities[0].linear.y,
+                    target.velocities[0].linear.z;
       }
-      
-      RCLCPP_INFO(this->get_logger(), "Received trajectory with %zu points", traj_msg->points.size());
-      
-      // Store trajectory points
-      trajectory_points_ = traj_msg->points;
-      current_trajectory_index_ = 0;
-      trajectory_active_ = true;
-      trajectory_start_time_ = this->now();
-      
-      RCLCPP_INFO(this->get_logger(), "Trajectory tracking started");
+
+      if (!target.accelerations.empty()) {
+            ad << target.accelerations[0].linear.x,
+                    target.accelerations[0].linear.y,
+                    target.accelerations[0].linear.z;
+      }
   }
 
 
@@ -279,58 +250,8 @@ public:
   }
 
   void controlLoop(){
-    // Update desired state from trajectory if active
-    if (trajectory_active_ && !trajectory_points_.empty()) {
-      auto elapsed = (this->now() - trajectory_start_time_).seconds();
-      
-      // Find the appropriate trajectory point based on time
-      size_t target_index = 0;
-      for (size_t i = 0; i < trajectory_points_.size(); ++i) {
-        if (trajectory_points_[i].time_from_start.sec + 
-            trajectory_points_[i].time_from_start.nanosec * 1e-9 <= elapsed) {
-          target_index = i;
-        } else {
-          break;
-        }
-      }
-      
-      // Check if trajectory is complete
-      if (target_index >= trajectory_points_.size() - 1) {
-        auto last_time = trajectory_points_.back().time_from_start.sec + 
-                        trajectory_points_.back().time_from_start.nanosec * 1e-9;
-        if (elapsed >= last_time) {
-          RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-            "Trajectory complete");
-          trajectory_active_ = false;
-          target_index = trajectory_points_.size() - 1;
-        }
-      }
-      
-      current_trajectory_index_ = target_index;
-      auto& point = trajectory_points_[target_index];
-      
-      // Update desired state from trajectory point
-      if (!point.transforms.empty() && !point.velocities.empty() && !point.accelerations.empty()) {
-        xd << point.transforms[0].translation.x,
-              point.transforms[0].translation.y,
-              point.transforms[0].translation.z;
-        
-        vd << point.velocities[0].linear.x,
-              point.velocities[0].linear.y,
-              point.velocities[0].linear.z;
-        
-        ad << point.accelerations[0].linear.x,
-              point.accelerations[0].linear.y,
-              point.accelerations[0].linear.z;
-        
-        // Extract yaw from quaternion
-        auto q = point.transforms[0].rotation;
-        double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
-        double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
-        yawd = std::atan2(siny_cosp, cosy_cosp);
-      }
-    }
-    
+    updateDesiredStateFromCarrot();
+
     Eigen::Vector3d ex, ev, er, eomega;
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
