@@ -121,6 +121,14 @@ def generate_launch_description():
         parameters=[{'use_sim_time': True}],
     )
 
+    lantern_location_node = Node(
+        package="lantern_location",
+        executable="lantern_location_node",
+        name="lantern_location_node",
+        output="screen",
+        parameters=[{'use_sim_time': True}],
+    )
+
     rviz_node = Node(
         package="rviz2",
         executable="rviz2",
@@ -199,6 +207,7 @@ def generate_launch_description():
             w_to_unity,
             mapping_launch,
             controller_node,
+            lantern_location_node,
             rviz_node,
             *static_tf_nodes,
         ]

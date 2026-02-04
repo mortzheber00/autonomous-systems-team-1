@@ -400,9 +400,9 @@ private:
       marker.pose.orientation.w = 1.0;
       
       // Set scale (0.3m diameter sphere)
-      marker.scale.x = 0.3;
-      marker.scale.y = 0.3;
-      marker.scale.z = 0.3;
+      marker.scale.x = 5.0;
+      marker.scale.y = 5.0;
+      marker.scale.z = 5.0;
       
       // Set color (orange/yellow for lantern, brighter with more updates)
       float brightness = std::min(1.0f, 0.5f + 0.1f * lantern.update_count);
