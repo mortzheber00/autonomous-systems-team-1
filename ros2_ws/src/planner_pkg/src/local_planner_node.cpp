@@ -138,6 +138,7 @@ private:
   const float x_limit_position_ = -370.0;           // Cave boundary limit
   const size_t movement_history_size_ = 10;         // Number of movement samples for moving average
   const float frontier_safety_radius_ = 1.0;        // Clearance radius around frontier - reduced from 2.0 to be less restrictive
+  const size_t frontier_buffer_max_size_ = 5;       // Maximum number of frontier sets to buffer between octomap updates
   
   // Stability Parameters
   const double goal_reached_tolerance_ = 20.0;      // Meters. Drone is "close enough" to switch goals
@@ -326,8 +327,25 @@ private:
       current_frontiers.push_back(candidate);
     }
     
-    // Add to buffer
+    // Add to buffer and maintain max size
     frontier_buffer_.push_back(current_frontiers);
+    if (frontier_buffer_.size() > frontier_buffer_max_size_) {
+      // Sort buffer by max gain and remove lowest-gain frontier set
+      std::sort(frontier_buffer_.begin(), frontier_buffer_.end(),
+        [](const std::vector<FrontierCandidate>& a, const std::vector<FrontierCandidate>& b) {
+          float max_gain_a = a.empty() ? -1.0f : a[0].total_gain;
+          float max_gain_b = b.empty() ? -1.0f : b[0].total_gain;
+          for (const auto& candidate : a) {
+            max_gain_a = std::max(max_gain_a, candidate.total_gain);
+          }
+          for (const auto& candidate : b) {
+            max_gain_b = std::max(max_gain_b, candidate.total_gain);
+          }
+          return max_gain_a > max_gain_b;  // Descending order
+        });
+      
+      frontier_buffer_.pop_back();  // Remove the last (lowest gain) element
+    }
     
     // If octomap just updated, compute mean frontier from buffer
     octomap::point3d mean_frontier;
@@ -340,29 +358,22 @@ private:
         }
       }
       
-      // Find the frontier closest to all others (minimum sum of distances)
+      // Compute geometric mean (average x, y, z) across all buffered frontiers
       if (!all_buffered.empty()) {
-        float min_total_distance = std::numeric_limits<float>::max();
-        size_t best_idx = 0;
-        
-        for (size_t i = 0; i < all_buffered.size(); ++i) {
-          float total_distance = 0.0f;
-          for (size_t j = 0; j < all_buffered.size(); ++j) {
-            if (i != j) {
-              total_distance += all_buffered[i].position.distance(all_buffered[j].position);
-            }
-          }
-          
-          if (total_distance < min_total_distance) {
-            min_total_distance = total_distance;
-            best_idx = i;
-          }
+        double mean_x = 0.0, mean_y = 0.0, mean_z = 0.0;
+        for (const auto& candidate : all_buffered) {
+          mean_x += candidate.position.x();
+          mean_y += candidate.position.y();
+          mean_z += candidate.position.z();
         }
+        mean_x /= all_buffered.size();
+        mean_y /= all_buffered.size();
+        mean_z /= all_buffered.size();
         
-        mean_frontier = all_buffered[best_idx].position;
+        mean_frontier = octomap::point3d(mean_x, mean_y, mean_z);
         RCLCPP_INFO(get_logger(), 
-          "Using mean frontier from %lu buffered sets. Position: (%.1f, %.1f, %.1f), Total distance to others: %.1f",
-          frontier_buffer_.size(), mean_frontier.x(), mean_frontier.y(), mean_frontier.z(), min_total_distance);
+          "Using geometric mean frontier from %lu buffered sets. Position: (%.1f, %.1f, %.1f)",
+          frontier_buffer_.size(), mean_frontier.x(), mean_frontier.y(), mean_frontier.z());
         
         octomap_just_updated_ = false;
       }
