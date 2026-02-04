@@ -100,7 +100,7 @@ public:
 
     // bind controllerNode::onCurrentState() to the topic "current_state"
     current_state_subscriber_ = this->create_subscription<nav_msgs::msg::Odometry>(
-        "/current_state", 10,
+        "/current_state_est", 10,
         std::bind(&ControllerNode::onCurrentState, this, std::placeholders::_1));
 
     // Publisher for Motor Commands

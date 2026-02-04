@@ -55,7 +55,7 @@ public:
     
     // Subscribe to current drone position (odometry)
     odom_subscriber = create_subscription<nav_msgs::msg::Odometry>(
-      "/current_state",  // Change to /odom or your drone's odometry topic
+      "/current_state_est",  // Change to /odom or your drone's odometry topic
       10,
       std::bind(&RRT3DNode::odom_callback, this, std::placeholders::_1)
     );

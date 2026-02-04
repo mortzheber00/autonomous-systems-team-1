@@ -83,7 +83,7 @@ public:
     
     // Subscribe to drone odometry for position tracking and flight path recording
     odom_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
-      "/current_state", 10,
+      "/current_state_est", 10,
       std::bind(&GlobalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
     

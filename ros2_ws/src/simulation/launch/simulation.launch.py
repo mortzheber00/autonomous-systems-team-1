@@ -119,7 +119,6 @@ def generate_launch_description():
         name="controller_node",
         output="screen",
         parameters=[{'use_sim_time': True}],
-        remappings=[('current_state', 'current_state')] #remap controllers input to /current_state_est
     )
 
     rviz_node = Node(
@@ -194,9 +193,9 @@ def generate_launch_description():
         + [
             unity_launch,
             simulation_node,
-            #state_estimate_corruptor,
-            #state_estimate_corruptor_disabled,
-            unity_state,
+            state_estimate_corruptor,
+            state_estimate_corruptor_disabled,
+            #unity_state,
             w_to_unity,
             mapping_launch,
             controller_node,
