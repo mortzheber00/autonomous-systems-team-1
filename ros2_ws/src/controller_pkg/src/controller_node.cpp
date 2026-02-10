@@ -65,10 +65,6 @@ class ControllerNode : public rclcpp::Node {
   // Storage for the full trajectory path (Carrot Following)
   std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> path_points_;
 
-  // Simple position blending for smoother trajectories
-  double position_smoothing_factor_;  // How much to smooth position changes
-  Eigen::Vector3d last_desired_position_; // Previous target for smooth transitions
-
   double hz;             // frequency of the main control loop
 
   static Eigen::Vector3d Vee(const Eigen::Matrix3d& in){
@@ -91,7 +87,7 @@ public:
     xd(-38,10,9),
     vd(0,0,0),
     ad(0,0,0),
-    yawd(3.14159265)  
+    yawd(0)
   {
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     //  PART 2 |  Initialize ROS callback handlers
@@ -139,13 +135,6 @@ public:
          0.0,1.0,0.0,
          0.0,0.0,1.0;
 
-    // Initialize simple position blending
-    position_smoothing_factor_ = 0.7;  // 
-    last_desired_position_ = xd;       // Initialize with current desired position
-    
-    // Declare parameter for live tuning
-    this->declare_parameter<double>("position_smoothing_factor", position_smoothing_factor_);
-    
     RCLCPP_INFO(this->get_logger(), "controller_node ready (hz=%.1f)", hz);
   }
 
@@ -203,12 +192,11 @@ public:
       
       const auto& target = path_points_[target_idx];
 
-      // 3. Update Desired State with Simple Position Blending
-      Eigen::Vector3d raw_target = last_desired_position_; // Default to last target
+      // 3. Update Desired State
       if (!target.transforms.empty()) {
-            raw_target << target.transforms[0].translation.x,
-                         target.transforms[0].translation.y,
-                         target.transforms[0].translation.z;
+            xd << target.transforms[0].translation.x,
+                    target.transforms[0].translation.y,
+                    target.transforms[0].translation.z;
             
             // Extract yaw
             auto q = target.transforms[0].rotation;
@@ -216,16 +204,6 @@ public:
             double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
             yawd = std::atan2(siny_cosp, cosy_cosp);
       }
-      
-      // Apply simple position smoothing
-      position_smoothing_factor_ = this->get_parameter("position_smoothing_factor").as_double();
-      
-      // Exponential smoothing: smooth blend between old and new target
-      xd = (1.0 - position_smoothing_factor_) * last_desired_position_ + 
-           position_smoothing_factor_ * raw_target;
-      
-      // Store for next iteration
-      last_desired_position_ = xd;
 
       if (!target.velocities.empty()) {
             vd << target.velocities[0].linear.x,
