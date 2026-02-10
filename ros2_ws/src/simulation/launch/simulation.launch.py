@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import os
 
+from ament_index_python.packages import get_package_share_directory
 from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument, IncludeLaunchDescription
 from launch.conditions import IfCondition, UnlessCondition
@@ -33,6 +35,9 @@ def generate_launch_description():
         DeclareLaunchArgument("depth_image_topic", default_value="realsense/depth/image"),
         DeclareLaunchArgument("depth_info_topic", default_value="realsense/depth/camera_info"),
     ]
+
+    package_dir = get_package_share_directory("simulation")
+    rviz_config_path = os.path.join(package_dir, "config", "visualization.rviz")
 
     # <include file="$(find simulation)/launch/unity_ros.launch"> ...
     # Assumes the included file is also a ROS2 Python launch file named unity_ros.launch.py
@@ -114,7 +119,23 @@ def generate_launch_description():
         name="controller_node",
         output="screen",
         parameters=[{'use_sim_time': True}],
-        remappings=[('current_state', 'current_state')] #remap controllers input to /current_state_est
+    )
+
+    lantern_location_node = Node(
+        package="lantern_location",
+        executable="lantern_location_node",
+        name="lantern_location_node",
+        output="screen",
+        parameters=[{'use_sim_time': True}],
+    )
+
+    rviz_node = Node(
+        package="rviz2",
+        executable="rviz2",
+        name="rviz2",
+        output="screen",
+        parameters=[{"use_sim_time": True}],
+        arguments=["-d", rviz_config_path],
     )
 
     mapping_launch = IncludeLaunchDescription(
@@ -180,12 +201,14 @@ def generate_launch_description():
         + [
             unity_launch,
             simulation_node,
-            #state_estimate_corruptor,
-            #state_estimate_corruptor_disabled,
-            unity_state,
+            state_estimate_corruptor,
+            state_estimate_corruptor_disabled,
+            #unity_state,
             w_to_unity,
             mapping_launch,
             controller_node,
+            lantern_location_node,
+            rviz_node,
             *static_tf_nodes,
         ]
     )

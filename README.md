@@ -14,6 +14,19 @@ colcon build
 source install/setup.bash
 ```
 
+## Install dependencies with rosdep
+The first time using `rosdep`, it must be initialized via:
+
+```
+sudo rosdep init
+rosdep update
+```
+
+To install all dependencies run the following command in the `/ros2_ws` directory:
+
+```
+rosdep install --from-paths src -y --ignore-src
+```
 
 ## Simulation
 Copy the unpacked simulation files into the folder `ros2_ws/install/simulation/lib/simulation`.

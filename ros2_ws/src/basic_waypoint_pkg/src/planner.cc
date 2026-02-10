@@ -1,5 +1,5 @@
 #include "basic_waypoint_pkg/planner.hpp"
-
+#include <cmath>
 #include <utility>
 
 BasicPlanner::BasicPlanner(const rclcpp::Node::SharedPtr & node)
@@ -58,7 +58,7 @@ BasicPlanner::BasicPlanner(const rclcpp::Node::SharedPtr & node)
   // Subscriber for Odometry
   sub_odom_ =
     node_->create_subscription<nav_msgs::msg::Odometry>(
-      "current_state", 10,
+      "current_state_est", 10,
       std::bind(&BasicPlanner::uavOdomCallback, this, std::placeholders::_1));
 }
 
@@ -224,6 +224,51 @@ bool BasicPlanner::planTrajectory(
 
   // get trajectory as polynomial parameters
   opt.getTrajectory(trajectory);
+
+  // ===========================================================================
+  // Step 2: Add yaw to the trajectory so the drone faces the direction of flight.
+  // ===========================================================================
+  
+  // Setup yaw vertices matching the position vertices
+  mav_trajectory_generation::Vertex::Vector yaw_vertices;
+  const int yaw_dimension = 1;
+  const int yaw_derivative_to_optimize = mav_trajectory_generation::derivative_order::SNAP;
+
+  // Start Yaw: from current pose
+  // We use atan2 to get the current yaw from the rotation matrix
+  double current_yaw = atan2(current_pose_.rotation()(1, 0), current_pose_.rotation()(0, 0));
+  mav_trajectory_generation::Vertex start_yaw(yaw_dimension);
+  start_yaw.makeStartOrEnd(Eigen::VectorXd::Constant(yaw_dimension, current_yaw), yaw_derivative_to_optimize);
+  yaw_vertices.push_back(start_yaw);
+
+  // Intermediate Yaws: unconstrained
+  for (size_t i = 1; i < vertices.size() - 1; ++i) {
+      mav_trajectory_generation::Vertex mid_yaw(yaw_dimension);
+      yaw_vertices.push_back(mid_yaw);
+  }
+
+  // End Yaw: face negative x (PI) at start point
+  double desired_yaw = M_PI;
+  mav_trajectory_generation::Vertex end_yaw(yaw_dimension);
+  end_yaw.makeStartOrEnd(Eigen::VectorXd::Constant(yaw_dimension, desired_yaw), yaw_derivative_to_optimize);
+  yaw_vertices.push_back(end_yaw);
+
+  // Optimize yaw trajectory using the same segment times from position trajectory
+  std::vector<double> segment_times_yaw = trajectory->getSegmentTimes();
+  mav_trajectory_generation::PolynomialOptimization<N> yaw_opt(yaw_dimension);
+  if (!yaw_opt.setupFromVertices(yaw_vertices, segment_times_yaw, yaw_derivative_to_optimize)) {
+       RCLCPP_ERROR(node_->get_logger(), "Yaw optimization setup failed!");
+       return false;
+  }
+  yaw_opt.solveLinear();
+
+  mav_trajectory_generation::Trajectory trajectory_yaw;
+  yaw_opt.getTrajectory(&trajectory_yaw);
+
+  // Combine 3D position trajectory with 1D yaw trajectory
+  mav_trajectory_generation::Trajectory trajectory_with_yaw;
+  trajectory->getTrajectoryWithAppendedDimension(trajectory_yaw, &trajectory_with_yaw);
+  *trajectory = trajectory_with_yaw;
 
   return true;
 }
