@@ -47,6 +47,8 @@
 #include <memory>
 #include <chrono>
 #include <string>
+#include <queue>
+#include <limits>
 
 // ============================================================================
 // Data Structures
@@ -140,7 +142,7 @@ public:
     declare_parameter("goal_reached_tolerance_m",   8.0);
     declare_parameter("exploration_eval_radius_m", 10.0);
     declare_parameter("stagnation_timeout_sec",    20.0);
-    declare_parameter("junction_confirm_count",       1);
+    declare_parameter("junction_confirm_count",       0);
     declare_parameter("min_frontier_gain_for_timer",  0.3);    
     declare_parameter("candidate_merge_radius_m",    30.0);
     declare_parameter("breadcrumb_spacing_m",        30.0);
@@ -773,61 +775,122 @@ private:
   // ==========================================================================
 
   /**
-   * Build a route of intermediate waypoints from the current position to a target
-   * by walking backwards through the breadcrumb trail.
+   * Build the shortest route from the current position to a target using
+   * the breadcrumb trail as a graph.
    *
-   * This ensures each hop is short enough for the RRT to plan in its
-   * node_limit / time budget.
+   * The naive approach (walk the chain) fails when the drone explored a loop:
+   * it would trace the entire loop perimeter.  Instead we run Dijkstra over a
+   * graph where:
+   *   - Consecutive breadcrumbs are always connected (the chain edges).
+   *   - Any two breadcrumbs within `shortcut_radius` of each other are also
+   *     connected (shortcut edges that cut across loops).
+   *
+   * Result: the shortest Euclidean-distance path through known positions.
    */
   std::vector<geometry_msgs::msg::Point> build_backtrack_route(
       const geometry_msgs::msg::Point& target) {
 
     std::vector<geometry_msgs::msg::Point> route;
     if (breadcrumbs_.empty()) {
-      // No breadcrumbs — direct route (may fail if too far)
       route.push_back(target);
       return route;
     }
 
-    // Find the breadcrumb closest to the target
-    size_t closest_idx = 0;
-    double closest_dist = std::numeric_limits<double>::max();
-    for (size_t i = 0; i < breadcrumbs_.size(); ++i) {
-      double d = point_distance(breadcrumbs_[i], target);
-      if (d < closest_dist) {
-        closest_dist = d;
-        closest_idx = i;
-      }
-    }
+    const size_t N = breadcrumbs_.size();
 
-    // Find the breadcrumb closest to the drone's current position
+    // Find breadcrumb closest to the drone's current position
     size_t start_idx = 0;
-    double start_dist = std::numeric_limits<double>::max();
-    for (size_t i = 0; i < breadcrumbs_.size(); ++i) {
-      double d = point_distance(breadcrumbs_[i], current_position_);
-      if (d < start_dist) {
-        start_dist = d;
-        start_idx = i;
+    {
+      double best = std::numeric_limits<double>::max();
+      for (size_t i = 0; i < N; ++i) {
+        double d = point_distance(breadcrumbs_[i], current_position_);
+        if (d < best) { best = d; start_idx = i; }
       }
     }
 
-    // Walk from start_idx toward closest_idx along the breadcrumb chain
-    if (start_idx <= closest_idx) {
-      // Target is "ahead" in the trail — walk forward
-      for (size_t i = start_idx; i <= closest_idx; ++i) {
-        route.push_back(breadcrumbs_[i]);
-      }
-    } else {
-      // Target is "behind" — walk backward (the common backtracking case)
-      for (size_t i = start_idx; i != static_cast<size_t>(-1) && i >= closest_idx; --i) {
-        route.push_back(breadcrumbs_[i]);
-        if (i == 0) break;  // Prevent underflow
+    // Find breadcrumb closest to the target
+    size_t goal_idx = 0;
+    {
+      double best = std::numeric_limits<double>::max();
+      for (size_t i = 0; i < N; ++i) {
+        double d = point_distance(breadcrumbs_[i], target);
+        if (d < best) { best = d; goal_idx = i; }
       }
     }
 
-    // Downsample: keep only every ~breadcrumb_spacing_ worth of distance
-    // The breadcrumbs are already spaced by breadcrumb_spacing_, but if
-    // there are many close together we can skip some.
+    if (start_idx == goal_idx) {
+      route.push_back(breadcrumbs_[goal_idx]);
+      RCLCPP_INFO(get_logger(),
+        "[BACKTRACK ROUTE] Start and goal on same breadcrumb");
+      return route;
+    }
+
+    // ---- Dijkstra over breadcrumb graph ----
+    // Shortcut radius: connect non-consecutive breadcrumbs that are physically
+    // close. 1.5× spacing catches loop-closure shortcuts reliably.
+    const double shortcut_radius = breadcrumb_spacing_ * 1.5;
+
+    std::vector<double> dist(N, std::numeric_limits<double>::max());
+    std::vector<int> prev(N, -1);
+
+    // Min-heap: (distance, index)
+    using PQEntry = std::pair<double, size_t>;
+    std::priority_queue<PQEntry, std::vector<PQEntry>, std::greater<PQEntry>> pq;
+
+    dist[start_idx] = 0.0;
+    pq.push({0.0, start_idx});
+
+    while (!pq.empty()) {
+      auto [d_u, u] = pq.top();
+      pq.pop();
+
+      if (d_u > dist[u]) continue;   // stale entry
+      if (u == goal_idx) break;      // shortest path found
+
+      // Helper: relax edge u -> v
+      auto relax = [&](size_t v) {
+        double edge_len = point_distance(breadcrumbs_[u], breadcrumbs_[v]);
+        double new_dist = dist[u] + edge_len;
+        if (new_dist < dist[v]) {
+          dist[v] = new_dist;
+          prev[v] = static_cast<int>(u);
+          pq.push({new_dist, v});
+        }
+      };
+
+      // 1. Chain edges (consecutive breadcrumbs)
+      if (u > 0)      relax(u - 1);
+      if (u + 1 < N)  relax(u + 1);
+
+      // 2. Shortcut edges to any nearby breadcrumb (handles loops)
+      for (size_t v = 0; v < N; ++v) {
+        if (v == u) continue;
+        if (v + 1 == u || u + 1 == v) continue;  // already handled
+        if (point_distance(breadcrumbs_[u], breadcrumbs_[v]) <= shortcut_radius) {
+          relax(v);
+        }
+      }
+    }
+
+    // ---- Reconstruct path ----
+    if (prev[goal_idx] == -1 && start_idx != goal_idx) {
+      RCLCPP_WARN(get_logger(),
+        "[BACKTRACK ROUTE] Dijkstra found no path — using direct route");
+      route.push_back(target);
+      return route;
+    }
+
+    std::vector<size_t> path_indices;
+    for (int idx = static_cast<int>(goal_idx); idx != -1; idx = prev[idx]) {
+      path_indices.push_back(static_cast<size_t>(idx));
+    }
+    std::reverse(path_indices.begin(), path_indices.end());
+
+    for (size_t idx : path_indices) {
+      route.push_back(breadcrumbs_[idx]);
+    }
+
+    // Downsample: skip intermediate waypoints that are very close
     if (route.size() > 2) {
       std::vector<geometry_msgs::msg::Point> sparse;
       sparse.push_back(route.front());
@@ -840,9 +903,10 @@ private:
       route = sparse;
     }
 
+    double total_dist = dist[goal_idx];
     RCLCPP_INFO(get_logger(),
-      "[BACKTRACK ROUTE] Built %zu-waypoint route from breadcrumbs (%zu total crumbs)",
-      route.size(), breadcrumbs_.size());
+      "[BACKTRACK ROUTE] Dijkstra: %zu waypoints, %.0fm total (from %zu breadcrumbs)",
+      route.size(), total_dist, N);
 
     return route;
   }
