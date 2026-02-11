@@ -8,6 +8,7 @@ endif()
 # find dependencies
 find_package(ament_cmake REQUIRED)
 find_package(rclcpp REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(geometry_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(mav_msgs REQUIRED)
@@ -41,6 +42,7 @@ target_include_directories(local_planner_node PUBLIC
 
 ament_target_dependencies(local_planner_node
   rclcpp
+  std_msgs
   geometry_msgs
   nav_msgs
   octomap_msgs
@@ -57,6 +59,7 @@ ament_target_dependencies(local_planner_node
 add_executable(global_planner_node src/global_planner_node.cpp)
 ament_target_dependencies(global_planner_node
   rclcpp
+  std_msgs
   geometry_msgs
   nav_msgs
   octomap_msgs

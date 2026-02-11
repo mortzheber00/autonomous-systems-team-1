@@ -9,6 +9,7 @@
  */
 
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <nav_msgs/msg/odometry.hpp>
@@ -20,6 +21,7 @@
 #include <octomap_msgs/conversions.h>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <vector>
 #include <algorithm>
 #include <memory>
@@ -65,10 +67,22 @@ public:
     // Create publisher for backtrack path (to guide drone back through flown points)
     backtrack_path_publisher_ = create_publisher<nav_msgs::msg::Path>("/backtrack_path", 10);
     
+    // Create publisher for backtrack goals as PoseArray (flown points + goal frontier → sent to RRT)
+    backtrack_goals_publisher_ = create_publisher<geometry_msgs::msg::PoseArray>("/backtrack_goals", 10);
+    
     // Create publisher for frontier visualization
     frontier_markers_publisher_ = create_publisher<visualization_msgs::msg::MarkerArray>("/global_frontier_markers", 10);
     
+    // Create publisher for flown points visualization
+    flown_points_publisher_ = create_publisher<visualization_msgs::msg::MarkerArray>("/flown_points_markers", 10);
+    
     // ----- Subscribers -----
+    // Subscribe to local planner active status
+    local_planner_active_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/local_planner_active", 10,
+      std::bind(&GlobalPlannerNode::local_planner_active_callback, this, std::placeholders::_1)
+    );
+    
     // Subscribe to frontier goals from local planner to build frontier list
     frontier_subscription_ = create_subscription<geometry_msgs::msg::PoseArray>(
       "/frontier_goals", 10,
@@ -107,12 +121,15 @@ public:
 private:
   // Publishers
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr backtrack_path_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr backtrack_goals_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr frontier_markers_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr flown_points_publisher_;
   
   // Subscribers
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr frontier_subscription_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr local_planner_active_subscription_;
   
   // Timers
   rclcpp::TimerBase::SharedPtr planning_timer_;
@@ -120,6 +137,10 @@ private:
   
   // Octomap storage
   std::shared_ptr<octomap::OcTree> octree_;
+  
+  // State tracking
+  bool local_planner_active_ = true;    // Whether local planner is finding frontiers
+  bool backtrack_published_ = false;    // Whether we already published a backtrack goal
   
   // Frontier management
   std::vector<FrontierInfo> frontier_list_;
@@ -129,6 +150,12 @@ private:
   const int prune_interval_ = 5;                    // Prune every 5 new frontiers
   const float min_gain_threshold_ = 0.15;            // Minimum gain to keep frontier (reduced from 2.0 - gains are [0,1])
   const float exploration_radius_ = 5.0;            // Radius for exploration gain calculation
+  
+  // Global frontier discovery parameters
+  const float global_frontier_spacing_ = 20.0;     // Minimum distance between global frontiers (sparse)
+  const float volumetric_radius_ = 8.0;            // Radius for volumetric gain calculation
+  const float min_global_gain_ = 0.4;              // Minimum volumetric gain for global frontiers
+  int frontier_discovery_counter_ = 0;              // Timer for periodic frontier discovery
   
   // Flight tracking
   std::vector<geometry_msgs::msg::Point> flown_points_;
@@ -155,8 +182,7 @@ private:
       
       if (existing != frontier_list_.end()) {
         // Frontier already exists nearby - will be re-evaluated with Octomap
-        RCLCPP_INFO(get_logger(), "Frontier already in list (ID: %d) at distance %.2f. Skipping duplicate.",
-                     existing->id, distance(existing->position, point));
+        // Skip duplicate (no logging to reduce spam)
       } else {
         // Add new frontier if under limit
         if (frontier_list_.size() < max_frontiers_) {
@@ -221,8 +247,29 @@ private:
     
     // Add to flown points if far enough from last point
     if (flown_points_.empty() ||
-        distance(flown_points_.back(), current_position_) > 0.5) {
+        distance(flown_points_.back(), current_position_) > 10.0) {
       flown_points_.push_back(current_position_);
+      publish_flown_points_markers();
+    }
+  }
+
+  /**
+   * Callback for local planner active status
+   * 
+   * When local planner goes inactive, triggers backtracking.
+   * When local planner becomes active again, resets backtrack state.
+   */
+  void local_planner_active_callback(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    bool was_active = local_planner_active_;
+    local_planner_active_ = msg->data;
+    
+    if (was_active && !local_planner_active_) {
+      RCLCPP_WARN(get_logger(), "[GLOBAL] Local planner went INACTIVE - triggering backtrack planning");
+      backtrack_published_ = false;  // Allow new backtrack to be published
+    } else if (!was_active && local_planner_active_) {
+      RCLCPP_INFO(get_logger(), "[GLOBAL] Local planner is ACTIVE again - stopping backtrack");
+      backtrack_published_ = false;
     }
   }
 
@@ -235,27 +282,66 @@ private:
    */
   void planning_loop()
   {
-    // If we have frontiers and flown points, be ready to publish backtrack path
-    if (!frontier_list_.empty() && !flown_points_.empty()) {
-      FrontierInfo* best_frontier = select_best_frontier();
-      
-      if (best_frontier) {
-        RCLCPP_INFO(get_logger(), 
-                    "[BACKTRACK] Best frontier (ID: %d, Gain: %.3f) at (%.2f, %.2f, %.2f). "
-                    "Current pos: (%.2f, %.2f, %.2f). Flown points: %lu.",
-                    best_frontier->id, best_frontier->exploration_gain,
-                    best_frontier->position.x, best_frontier->position.y, best_frontier->position.z,
-                    current_position_.x, current_position_.y, current_position_.z,
-                    flown_points_.size());
-        
-        // Publish backtrack path to guide drone through flown points to reach best frontier
-        publish_backtrack_path(best_frontier);
-      }
-    } else if (frontier_list_.empty()) {
-      RCLCPP_WARN(get_logger(), "[GLOBAL] No frontiers in list yet");
-    } else if (flown_points_.empty()) {
-      RCLCPP_WARN(get_logger(), "[GLOBAL] No flown points recorded yet. Frontiers: %lu", frontier_list_.size());
+    // Periodically discover new frontiers (every 3 seconds)
+    frontier_discovery_counter_++;
+    if (frontier_discovery_counter_ >= 3 && octree_) {
+      discover_global_frontiers();
+      frontier_discovery_counter_ = 0;
     }
+    
+    // Always log current frontier count for visibility
+    size_t total_frontiers = frontier_list_.size();
+    size_t unvisited_frontiers = std::count_if(frontier_list_.begin(), frontier_list_.end(),
+                                               [](const FrontierInfo& f) { return !f.visited; });
+    
+    // Find highest gain among unvisited frontiers
+    float highest_gain = 0.0f;
+    for (const auto& frontier : frontier_list_) {
+      if (!frontier.visited && frontier.exploration_gain > highest_gain) {
+        highest_gain = frontier.exploration_gain;
+      }
+    }
+    
+    RCLCPP_INFO(get_logger(), "[GLOBAL] Frontier list: %zu total (%zu unvisited), highest gain: %.3f", 
+                total_frontiers, unvisited_frontiers, highest_gain);
+    
+    // Only act when local planner is inactive (can't find good frontiers)
+    if (local_planner_active_) {
+      return;  // Local planner is handling exploration
+    }
+    
+    // Don't re-publish if we already sent a backtrack goal
+    if (backtrack_published_) {
+      return;
+    }
+    
+    // Need frontiers and flown points to backtrack
+    if (frontier_list_.empty()) {
+      RCLCPP_WARN(get_logger(), "[GLOBAL] No frontiers in list for backtracking");
+      return;
+    }
+    if (flown_points_.empty()) {
+      RCLCPP_WARN(get_logger(), "[GLOBAL] No flown points recorded for backtracking");
+      return;
+    }
+    
+    FrontierInfo* best_frontier = select_best_frontier();
+    if (!best_frontier) {
+      RCLCPP_WARN(get_logger(), "[GLOBAL] No unvisited frontiers available");
+      return;
+    }
+    
+    RCLCPP_INFO(get_logger(), 
+                "[GLOBAL] Backtracking to frontier (ID: %d, Gain: %.3f) at (%.2f, %.2f, %.2f)",
+                best_frontier->id, best_frontier->exploration_gain,
+                best_frontier->position.x, best_frontier->position.y, best_frontier->position.z);
+    
+    // Build backtrack waypoint path and publish to RRT
+    publish_backtrack_goals(best_frontier);
+    backtrack_published_ = true;
+    
+    // Mark frontier as visited so we don't try it again
+    best_frontier->visited = true;
   }
 
   /**
@@ -303,43 +389,93 @@ private:
   }
 
   /**
-   * Publish backtrack path
+   * Publish backtrack goals as PoseArray to RRT
    * 
-   * Creates a path through flown points in reverse order for drone to backtrack to frontier.
-   * The drone follows this path to reach the next high-gain frontier for exploration.
+   * Builds an ordered list of waypoints:
+   * 1. Find the flown point nearest to the target frontier
+   * 2. Build path from current position through flown points to that nearest point
+   * 3. Append the target frontier as the final goal
    * 
-   * @param target_frontier - The frontier to backtrack towards
+   * The RRT will plan segment-by-segment through these waypoints.
+   * 
+   * @param target_frontier - The frontier to navigate towards
    */
-  void publish_backtrack_path(FrontierInfo* target_frontier)
+  void publish_backtrack_goals(FrontierInfo* target_frontier)
   {
-    if (!target_frontier) {
+    if (!target_frontier || flown_points_.empty()) {
       return;
     }
     
-    nav_msgs::msg::Path backtrack_path;
-    backtrack_path.header.frame_id = "world";
-    backtrack_path.header.stamp = get_clock()->now();
-    
-    // Add flown points in reverse order (backtrack from current position back through path)
-    for (auto it = flown_points_.rbegin(); it != flown_points_.rend(); ++it) {
-      geometry_msgs::msg::PoseStamped pose;
-      pose.header.frame_id = "world";
-      pose.header.stamp = get_clock()->now();
-      pose.pose.position = *it;
-      backtrack_path.poses.push_back(pose);
+    // Step 1: Find flown point nearest to target frontier
+    size_t nearest_idx = 0;
+    float nearest_dist = std::numeric_limits<float>::max();
+    for (size_t i = 0; i < flown_points_.size(); ++i) {
+      float dist = distance(flown_points_[i], target_frontier->position);
+      if (dist < nearest_dist) {
+        nearest_dist = dist;
+        nearest_idx = i;
+      }
     }
     
-    // Add the target frontier as final waypoint
-    geometry_msgs::msg::PoseStamped final_pose;
-    final_pose.header.frame_id = "world";
-    final_pose.header.stamp = get_clock()->now();
-    final_pose.pose.position = target_frontier->position;
-    backtrack_path.poses.push_back(final_pose);
+    // Step 2: Find flown point nearest to current drone position
+    size_t current_idx = 0;
+    float current_nearest_dist = std::numeric_limits<float>::max();
+    for (size_t i = 0; i < flown_points_.size(); ++i) {
+      float dist = distance(flown_points_[i], current_position_);
+      if (dist < current_nearest_dist) {
+        current_nearest_dist = dist;
+        current_idx = i;
+      }
+    }
     
-    backtrack_path_publisher_->publish(backtrack_path);
+    // Step 3: Build waypoint list from current_idx to nearest_idx through flown points
+    geometry_msgs::msg::PoseArray backtrack_goals;
+    backtrack_goals.header.stamp = get_clock()->now();
+    backtrack_goals.header.frame_id = "world";
+    
+    // Add flown points from current position toward the frontier
+    // Determine direction (forward or backward through flown_points_)
+    if (current_idx <= nearest_idx) {
+      // Forward through flown points
+      for (size_t i = current_idx; i <= nearest_idx; ++i) {
+        geometry_msgs::msg::Pose pose;
+        pose.position = flown_points_[i];
+        pose.orientation.w = 1.0;
+        backtrack_goals.poses.push_back(pose);
+      }
+    } else {
+      // Backward through flown points (backtracking)
+      for (size_t i = current_idx; i >= nearest_idx; --i) {
+        geometry_msgs::msg::Pose pose;
+        pose.position = flown_points_[i];
+        pose.orientation.w = 1.0;
+        backtrack_goals.poses.push_back(pose);
+        if (i == 0) break;  // Prevent underflow
+      }
+    }
+    
+    // Step 4: Append the target frontier as the final goal
+    geometry_msgs::msg::Pose frontier_pose;
+    frontier_pose.position = target_frontier->position;
+    frontier_pose.orientation.w = 1.0;
+    backtrack_goals.poses.push_back(frontier_pose);
+    
+    backtrack_goals_publisher_->publish(backtrack_goals);
+    
     RCLCPP_INFO(get_logger(), 
-               "Published backtrack path: %lu flown points + frontier (ID: %d, Gain: %.2f) as target",
-               flown_points_.size(), target_frontier->id, target_frontier->exploration_gain);
+               "[GLOBAL] Published backtrack goals: %zu waypoints (flown_pts[%zu→%zu] + frontier ID:%d)",
+               backtrack_goals.poses.size(), current_idx, nearest_idx, target_frontier->id);
+    
+    // Also publish as nav_msgs/Path for visualization
+    nav_msgs::msg::Path backtrack_path;
+    backtrack_path.header = backtrack_goals.header;
+    for (const auto& pose : backtrack_goals.poses) {
+      geometry_msgs::msg::PoseStamped ps;
+      ps.header = backtrack_goals.header;
+      ps.pose = pose;
+      backtrack_path.poses.push_back(ps);
+    }
+    backtrack_path_publisher_->publish(backtrack_path);
   }
 
   /**
@@ -566,6 +702,188 @@ private:
                    frontier_list_.size(), count_unvisited_frontiers(),
                    static_cast<int>(frontier_list_.size()) - count_unvisited_frontiers());
     }
+  }
+
+  /**
+   * Publish visualization markers for flown points
+   */
+  void publish_flown_points_markers()
+  {
+    visualization_msgs::msg::MarkerArray marker_array;
+    
+    for (size_t i = 0; i < flown_points_.size(); ++i) {
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "world";
+      marker.header.stamp = get_clock()->now();
+      marker.id = static_cast<int>(i);
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+      marker.pose.position = flown_points_[i];
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = 0.5;
+      marker.scale.y = 0.5;
+      marker.scale.z = 0.5;
+      marker.color.r = 0.0f;
+      marker.color.g = 1.0f;  // Green
+      marker.color.b = 0.0f;
+      marker.color.a = 1.0f;
+      marker.lifetime = rclcpp::Duration(std::chrono::seconds(0));  // Persistent
+      
+      marker_array.markers.push_back(marker);
+    }
+    
+    flown_points_publisher_->publish(marker_array);
+  }
+
+  // ---------------------------------------------------------------------------
+  // Global Frontier Discovery
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Discover global frontiers based on volumetric gain only
+   * Creates a sparse set of high-value exploration targets
+   */
+  void discover_global_frontiers()
+  {
+    if (!octree_) return;
+    
+    RCLCPP_DEBUG(get_logger(), "[GLOBAL] Discovering frontiers from octree...");
+    
+    // Get all frontier points in the environment
+    std::vector<octomap::point3d> candidate_frontiers = get_global_frontier_points();
+    
+    int added_count = 0;
+    for (const auto& point : candidate_frontiers) {
+      // Calculate pure volumetric gain (no direction bias)
+      float volumetric_gain = calculate_volumetric_gain(point, volumetric_radius_);
+      
+      // Skip low-gain frontiers
+      if (volumetric_gain < min_global_gain_) {
+        continue;
+      }
+      
+      // Check if too close to existing frontiers (maintain sparsity)
+      geometry_msgs::msg::Point geo_point;
+      geo_point.x = point.x();
+      geo_point.y = point.y();
+      geo_point.z = point.z();
+      
+      auto nearby = find_nearby_frontier(geo_point, global_frontier_spacing_);
+      if (nearby != frontier_list_.end()) {
+        continue; // Too close to existing frontier
+      }
+      
+      // Add new global frontier
+      if (frontier_list_.size() < max_frontiers_) {
+        frontier_list_.emplace_back(geo_point, volumetric_gain, frontier_counter_++);
+        added_count++;
+        
+        RCLCPP_INFO(get_logger(), "[GLOBAL] Discovered frontier (ID: %d) at (%.2f, %.2f, %.2f) gain=%.3f",
+                    frontier_counter_ - 1, point.x(), point.y(), point.z(), volumetric_gain);
+        
+        if (added_count >= 3) break; // Limit discovery per cycle
+      }
+    }
+    
+    if (added_count > 0) {
+      RCLCPP_INFO(get_logger(), "[GLOBAL] Added %d new frontiers, total: %zu", 
+                  added_count, frontier_list_.size());
+    }
+  }
+
+  /**
+   * Find frontier points in the global octree
+   * A frontier is at the boundary between free and unknown space
+   */
+  std::vector<octomap::point3d> get_global_frontier_points()
+  {
+    std::vector<octomap::point3d> frontiers;
+    if (!octree_) return frontiers;
+    
+    double resolution = octree_->getResolution();
+    
+    // Traditional frontier detection: Free space adjacent to unknown
+    for (auto it = octree_->begin_leafs(); it != octree_->end_leafs(); ++it) {
+      if (octree_->isNodeOccupied(*it)) continue;  // Only free space
+      
+      octomap::point3d center = it.getCoordinate();
+      
+      // Check 26 neighbors (3x3x3 cube minus center) for unknown space
+      bool is_frontier = false;
+      for (int dx = -1; dx <= 1 && !is_frontier; dx++) {
+        for (int dy = -1; dy <= 1 && !is_frontier; dy++) {
+          for (int dz = -1; dz <= 1 && !is_frontier; dz++) {
+            if (dx == 0 && dy == 0 && dz == 0) continue;
+            
+            octomap::point3d neighbor(
+              center.x() + dx * resolution,
+              center.y() + dy * resolution, 
+              center.z() + dz * resolution
+            );
+            
+            octomap::OcTreeNode* neighbor_node = octree_->search(neighbor);
+            if (!neighbor_node) {
+              // Unknown neighbor = potential frontier
+              is_frontier = true;
+            }
+          }
+        }
+      }
+      
+      if (is_frontier) {
+        frontiers.push_back(center);
+      }
+    }
+    
+    RCLCPP_DEBUG(get_logger(), "[GLOBAL] Found %zu traditional frontiers", frontiers.size());
+    return frontiers;
+  }
+
+  /**
+   * Calculate volumetric gain for a frontier point
+   * Pure exploration potential based on unknown voxels nearby
+   */
+  float calculate_volumetric_gain(const octomap::point3d& point, float radius)
+  {
+    if (!octree_) return 0.0f;
+    
+    int unknown_voxels = 0;
+    int total_voxels = 0;
+    double resolution = octree_->getResolution();
+    float step_size = std::max(resolution, 1.0); // Step by at least 1m for efficiency
+    
+    for (float dx = -radius; dx <= radius; dx += step_size) {
+      for (float dy = -radius; dy <= radius; dy += step_size) {
+        for (float dz = -radius; dz <= radius; dz += step_size) {
+          // Skip if outside spherical radius
+          float dist = sqrt(dx*dx + dy*dy + dz*dz);
+          if (dist > radius) continue;
+          
+          octomap::point3d sample(point.x() + dx, point.y() + dy, point.z() + dz);
+          octomap::OcTreeNode* node = octree_->search(sample);
+          
+          total_voxels++;
+          if (!node) {
+            // Unknown voxel
+            unknown_voxels++;
+          }
+        }
+      }
+    }
+    
+    return total_voxels > 0 ? static_cast<float>(unknown_voxels) / total_voxels : 0.0f;
+  }
+
+  /**
+   * Find nearby frontier with custom distance threshold
+   */
+  std::vector<FrontierInfo>::iterator find_nearby_frontier(const geometry_msgs::msg::Point& point, float threshold)
+  {
+    return std::find_if(frontier_list_.begin(), frontier_list_.end(),
+      [&point, threshold, this](const FrontierInfo& frontier) {
+        float dist = distance(frontier.position, point);
+        return dist < threshold;
+      });
   }
 };
 

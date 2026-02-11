@@ -13,6 +13,7 @@
  */
 
 #include <rclcpp/rclcpp.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <octomap/octomap.h>
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
@@ -44,8 +45,16 @@ public:
     // Create publisher for top 5 frontier goals (to RRT planner)
     frontier_publisher_ = create_publisher<geometry_msgs::msg::PoseArray>("/frontier_goals", 10);
     marker_publisher_ = create_publisher<visualization_msgs::msg::MarkerArray>("/frontier_goals_markers", 10);
+    // Publish whether local planner is actively finding frontiers
+    active_publisher_ = create_publisher<std_msgs::msg::Bool>("/local_planner_active", 10);
     
     // ----- Subscribers -----
+    // Subscribe to backtrack complete signal from RRT
+    backtrack_complete_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/backtrack_complete", 10,
+      std::bind(&LocalPlannerNode::backtrack_complete_callback, this, std::placeholders::_1)
+    );
+    
     // Subscribe to Octomap updates
     octomap_subscription_ = create_subscription<octomap_msgs::msg::Octomap>(
       "/octomap_full",
@@ -61,7 +70,7 @@ public:
 
     // Timer: Run planning loop at 2 Hz (500ms)
     planning_timer_ = create_wall_timer(
-        std::chrono::milliseconds(500),
+        std::chrono::milliseconds(1000),
         std::bind(&LocalPlannerNode::planning_loop, this)
     );
     
@@ -79,8 +88,10 @@ private:
   // ---------------------------------------------------------------------------
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr frontier_publisher_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr active_publisher_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr backtrack_complete_subscription_;
   rclcpp::TimerBase::SharedPtr planning_timer_;
 
   // Data Storage
@@ -88,7 +99,14 @@ private:
   geometry_msgs::msg::Point last_drone_position_;
   
   // Moving average of drone movement direction
-  std::vector<tf2::Vector3> movement_history_; 
+  std::vector<tf2::Vector3> movement_history_;
+  
+  // State tracking
+  bool is_active_ = true;               // Whether local planner is publishing frontiers
+  bool is_backtracking_ = false;         // Whether global planner is in backtrack mode
+  int consecutive_no_frontier_count_ = 0; // Counter for consecutive cycles with no good frontiers
+  const int no_frontier_threshold_ = 3;  // Cycles before declaring inactive
+  const float min_gain_for_publish_ = 0.05f; // Minimum gain to consider a frontier worth publishing 
 
   // Configuration
   const float exploration_radius_ = 10.0;    // Radius around frontier to calculate gain
@@ -96,6 +114,7 @@ private:
   const float search_radius_ = 60.0;         // Search radius for frontiers
   const float x_limit_position_ = -370.0;    // Cave boundary limit
   const size_t movement_history_size_ = 10;  // Number of movement samples for moving average
+  const float min_wall_distance_ = 3.0;      // Minimum distance from walls for frontiers (meters)
   
   // ---------------------------------------------------------------------------
   // Callbacks
@@ -139,6 +158,20 @@ private:
     }
   }
 
+  /**
+   * Callback for backtrack complete signal from RRT
+   * When backtracking is done, resume normal local planning
+   */
+  void backtrack_complete_callback(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    if (msg->data) {
+      RCLCPP_INFO(get_logger(), "Backtrack complete! Resuming local planning.");
+      is_backtracking_ = false;
+      is_active_ = true;
+      consecutive_no_frontier_count_ = 0;
+    }
+  }
+
   // ---------------------------------------------------------------------------
   // Planning Loop (The Core Logic)
   // ---------------------------------------------------------------------------
@@ -150,11 +183,67 @@ private:
         return;
     }
 
+    // If global planner is backtracking, don't publish frontiers
+    if (is_backtracking_) {
+        RCLCPP_DEBUG(get_logger(), "Backtracking in progress, local planner paused");
+        std_msgs::msg::Bool active_msg;
+        active_msg.data = false;
+        active_publisher_->publish(active_msg);
+        return;
+    }
+
     // Find top 5 frontiers
     std::vector<geometry_msgs::msg::Point> top_frontiers = find_top_frontiers(5);
+    
+    // Store best frontier info for logging
+    float best_gain = 0.0f;
+    octomap::point3d best_point(0, 0, 0);
+    
+    // Quick re-score the first frontier for logging (it's the best one)
+    if (!top_frontiers.empty() && current_octree_) {
+      const auto& frontier = top_frontiers[0];
+      best_point = octomap::point3d(frontier.x, frontier.y, frontier.z);
+      float volume_gain = calculate_volumetric_gain(current_octree_.get(), best_point, exploration_radius_);
+      float direction_gain = calculate_direction_gain(best_point);
+      best_gain = volume_gain * direction_gain;
+    }
 
     if (!top_frontiers.empty()) {
-        RCLCPP_INFO(get_logger(), "Publishing %zu frontiers to RRT", top_frontiers.size());
+        // Check if best frontier gain is too low (over-explored area)
+        const float min_quality_gain = 0.3f;
+        if (best_gain < min_quality_gain) {
+            RCLCPP_WARN(get_logger(), "[LOCAL] Best frontier gain %.3f < %.1f threshold - area over-explored, triggering backtrack", 
+                        best_gain, min_quality_gain);
+            
+            // Treat as no good frontiers - trigger backtracking
+            consecutive_no_frontier_count_++;
+            if (consecutive_no_frontier_count_ >= no_frontier_threshold_) {
+                is_active_ = false;
+                is_backtracking_ = true;
+                
+                RCLCPP_WARN(get_logger(), "LOCAL PLANNER INACTIVE (low gain) - signaling global planner for backtracking");
+                
+                // Publish inactive status to trigger global planner
+                std_msgs::msg::Bool active_msg;
+                active_msg.data = false;
+                active_publisher_->publish(active_msg);
+                return;  // Don't publish low-quality frontiers
+            }
+        } else {
+            // Reset no-frontier counter for good quality frontiers
+            consecutive_no_frontier_count_ = 0;
+        }
+        
+        is_active_ = true;
+        
+        // Log best goal details
+        RCLCPP_INFO(get_logger(), "[LOCAL] Best goal: (%.2f, %.2f, %.2f) gain=%.3f | Publishing %zu frontiers",
+                    best_point.x(), best_point.y(), best_point.z(), best_gain, top_frontiers.size());
+        
+        // Publish active status
+        std_msgs::msg::Bool active_msg;
+        active_msg.data = true;
+        active_publisher_->publish(active_msg);
         
         // Publish frontiers as PoseArray
         geometry_msgs::msg::PoseArray frontier_array;
@@ -170,6 +259,23 @@ private:
         
         frontier_publisher_->publish(frontier_array);
         publish_markers(top_frontiers);
+    } else {
+        // No good frontiers found
+        consecutive_no_frontier_count_++;
+        RCLCPP_WARN(get_logger(), "No good frontiers found (%d/%d before going inactive)",
+                    consecutive_no_frontier_count_, no_frontier_threshold_);
+        
+        if (consecutive_no_frontier_count_ >= no_frontier_threshold_) {
+            is_active_ = false;
+            is_backtracking_ = true;  // Will be reset by backtrack_complete callback
+            
+            RCLCPP_WARN(get_logger(), "LOCAL PLANNER INACTIVE - signaling global planner for backtracking");
+            
+            // Publish inactive status to trigger global planner
+            std_msgs::msg::Bool active_msg;
+            active_msg.data = false;
+            active_publisher_->publish(active_msg);
+        }
     }
   }
 
@@ -266,7 +372,7 @@ private:
         double size = octree->getNodeSize(leaf.getDepth());
         octomap::point3d leaf_coordinate = leaf.getCoordinate();
         
-        // Check 6 direct neighbors
+        // Check 6 direct neighbors for frontier detection
         double directions[6][3] = {
           {size, 0, 0}, {-size, 0, 0},
           {0, size, 0}, {0, -size, 0},
@@ -274,7 +380,6 @@ private:
         };
         
         bool is_frontier = false;
-        bool has_nearby_obstacle = false;
 
         for (auto& dir : directions) {
           octomap::point3d neighbor_point = 
@@ -284,15 +389,31 @@ private:
           // If neighbor doesn't exist in tree, it's unknown → this is a frontier
           if (!neighbor_node) {
             is_frontier = true;
-          } 
-          // Check if neighbor is occupied (too close to wall)
-          else if (neighbor_node->getOccupancy() > occupied_threshold_) {
-            has_nearby_obstacle = true;
+            break;
           }
         }
         
-        // Only add frontier if it's valid and not directly adjacent to obstacles
-        if (is_frontier && !has_nearby_obstacle) {
+        if (!is_frontier) continue;
+        
+        // Safety margin check: ensure frontier is at least min_wall_distance_ from any obstacle
+        // Check a bounding box of min_wall_distance_ around the frontier point
+        bool too_close_to_wall = false;
+        octomap::point3d min_pt = leaf_coordinate - octomap::point3d(min_wall_distance_, min_wall_distance_, min_wall_distance_);
+        octomap::point3d max_pt = leaf_coordinate + octomap::point3d(min_wall_distance_, min_wall_distance_, min_wall_distance_);
+        
+        for (auto it = octree->begin_leafs_bbx(min_pt, max_pt); 
+             it != octree->end_leafs_bbx(); ++it) {
+          if (it->getOccupancy() > occupied_threshold_) {
+            float dist = (it.getCoordinate() - leaf_coordinate).norm();
+            if (dist < min_wall_distance_) {
+              too_close_to_wall = true;
+              break;
+            }
+          }
+        }
+        
+        // Only add frontier if it's valid and far enough from obstacles
+        if (!too_close_to_wall) {
           frontiers.push_back(leaf_coordinate);
         }
       }
@@ -345,8 +466,10 @@ private:
     }
     
     // Reward points that are further from walls (centered in passages)
-    // Linear scaling: 0.5 at wall (0m) to 1.0 at center (5m or more)
-    float centering_bonus = std::min(1.0f, 0.5f + 0.1f * min_obstacle_dist);
+    // Quadratic scaling: strongly penalize points near walls
+    // 0.1 at wall (0m), ~0.5 at 2m, 1.0 at 4m or more
+    float normalized_dist = std::min(1.0f, min_obstacle_dist / 4.0f);
+    float centering_bonus = 0.1f + 0.9f * normalized_dist * normalized_dist;
     
     return volume_gain * centering_bonus;
   }

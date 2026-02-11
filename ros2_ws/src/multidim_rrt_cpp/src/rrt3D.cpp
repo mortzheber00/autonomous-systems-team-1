@@ -1,6 +1,7 @@
 #include "rclcpp/rclcpp.hpp"
 #include "nav_msgs/msg/path.hpp"
 #include "std_srvs/srv/empty.hpp"
+#include "std_msgs/msg/bool.hpp"
 #include "visualization_msgs/msg/marker.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -13,8 +14,8 @@
 #include "octomap_msgs/msg/octomap.hpp"
 #include <octomap/octomap.h>
 #include <octomap_msgs/conversions.h>
-#include "TreeNode.h"
 #include <memory>
+#include "rrt3D.hpp"
 
 /**
  * RRT3DNode - 3D Rapid Exploring Random Tree Planner with Safety Checks
@@ -38,12 +39,11 @@
  * - /rrt_tree (visualization_msgs/MarkerArray) - RRT tree visualization
  * - /rrt_path (visualization_msgs/Marker) - Final path visualization
  */
-class RRT3DNode : public rclcpp::Node
-{
-public:
-  RRT3DNode()
-      : Node("RRT3DNode"), step_size(3.0), goal_tolerance(3.0), 
-        node_limit(500), safety_radius_(2.0), occupied_threshold_(0.5)
+
+// Constructor implementation
+RRT3DNode::RRT3DNode()
+    : Node("RRT3DNode"), step_size(2.0), goal_tolerance(3.0), 
+      node_limit(750), safety_radius_(2.0), frontier_safety_radius_(1.0), occupied_threshold_(0.5)
   {
     // Create publisher for trajectory commands
     trajectory_publisher_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>("/command/trajectory", 10);
@@ -60,11 +60,21 @@ public:
     // Create publisher for waypoint path visualization (the actual path being followed)
     waypoint_path_publisher_ = create_publisher<visualization_msgs::msg::Marker>("rrt_waypoint_path", 10);
     
+    // Create publisher for backtrack complete signal
+    backtrack_complete_publisher_ = create_publisher<std_msgs::msg::Bool>("/backtrack_complete", 10);
+    
     // Subscribe to top 5 frontier goals from local planner
     frontier_subscriber = create_subscription<geometry_msgs::msg::PoseArray>(
       "/frontier_goals",
       10,
       std::bind(&RRT3DNode::frontier_callback, this, std::placeholders::_1)
+    );
+    
+    // Subscribe to backtrack goals from global planner
+    backtrack_subscriber = create_subscription<geometry_msgs::msg::PoseArray>(
+      "/backtrack_goals",
+      10,
+      std::bind(&RRT3DNode::backtrack_callback, this, std::placeholders::_1)
     );
     
     // Subscribe to current drone position (odometry)
@@ -91,49 +101,13 @@ public:
     RCLCPP_INFO(get_logger(), "Waiting for frontier list on /frontier_goals...");
   }
 
-private:
-  // Configuration parameters
-  const float step_size;              // Distance to extend tree at each iteration
-  const float goal_tolerance;         // Tolerance for reaching goal
-  const size_t node_limit;            // Maximum number of nodes before stopping
-  const float safety_radius_;         // Safety radius for obstacle clearance
-  const float occupied_threshold_;    // Occupancy probability threshold
-  
-  // Current state (updated by subscribers)
-  std::vector<float> start_position = {0.0f, 0.0f, 0.0f};  // Current drone position
-  std::vector<float> goal_position = {5.0f, 5.0f, 5.0f};   // Goal from local planner
-  std::vector<std::vector<float>> frontier_candidates_;     // List of frontier candidates
-  std::vector<float> current_goal_position_;                // Active goal for trajectory publishing
-  std::vector<std::vector<float>> current_path_;            // Waypoints from RRT path
-  size_t current_waypoint_idx_ = 0;                         // Index of current waypoint in path
-  bool has_goal = false;                                    // Whether we have a valid goal
-  bool is_planning = false;                                 // Prevent concurrent planning
-  bool goal_active_ = false;                                // Whether a goal is currently active
-  
-  // Octomap for safety checks
-  std::shared_ptr<octomap::OcTree> current_octree_;
-  
-  // RRT tree data structures
-  std::vector<int> map_size = {10, 10, 10};  // Configuration space bounds (not used with octomap)
-  std::vector<TreeNode *> node_list;         // All nodes in the tree
-  TreeNode *root_node;                       // Root node (start position)
-  
-  // ROS communication
-  nav_msgs::msg::Path path;
-  rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr trajectory_publisher_;
-  rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr path_publisher;
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr tree_marker_publisher;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr path_marker_publisher;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr waypoint_path_publisher_;
-  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr frontier_subscriber;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscriber;
-  rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
-  rclcpp::TimerBase::SharedPtr trajectory_timer_;
 
-  /**
-   * Callback for Octomap updates
-   */
-  void octomap_callback(const octomap_msgs::msg::Octomap::SharedPtr msg)
+// Method implementations
+
+/**
+ * Callback for Octomap updates
+ */
+void RRT3DNode::octomap_callback(const octomap_msgs::msg::Octomap::SharedPtr msg)
   {
     octomap::AbstractOcTree* tree = octomap_msgs::msgToMap(*msg);
     if (tree) {
@@ -152,9 +126,16 @@ private:
    * 
    * Called whenever local planner publishes top 5 frontier goals.
    * Tries each frontier in order until a valid path is found.
+   * Ignored during backtrack mode.
    */
-  void frontier_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
+  void RRT3DNode::frontier_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
   {
+    // Ignore frontier goals during backtrack mode
+    if (backtrack_mode_) {
+      RCLCPP_DEBUG(get_logger(), "In backtrack mode, ignoring frontier goals");
+      return;
+    }
+    
     if (msg->poses.empty()) {
       RCLCPP_WARN(get_logger(), "Received empty frontier list");
       return;
@@ -173,7 +154,7 @@ private:
       frontier_candidates_.push_back(frontier);
     }
     
-    // Start planning if not already planning
+    // Start planning if not already planning - allow re-planning even during active trajectory
     if (!is_planning)
     {
       is_planning = true;
@@ -183,9 +164,48 @@ private:
   }
 
   /**
+   * Callback for backtrack goals from global planner
+   * 
+   * Receives ordered list of waypoints (flown points + frontier goal).
+   * Enters backtrack mode and plans through waypoints sequentially.
+   */
+  void RRT3DNode::backtrack_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
+  {
+    if (msg->poses.empty()) {
+      RCLCPP_WARN(get_logger(), "Received empty backtrack goals");
+      return;
+    }
+    
+    RCLCPP_INFO(get_logger(), "[BACKTRACK] Received %zu backtrack waypoints from global planner", msg->poses.size());
+    
+    // Enter backtrack mode
+    backtrack_mode_ = true;
+    goal_active_ = false;  // Stop any current trajectory
+    
+    // Store all backtrack waypoints
+    backtrack_waypoints_.clear();
+    for (const auto& pose : msg->poses) {
+      std::vector<float> waypoint = {
+        static_cast<float>(pose.position.x),
+        static_cast<float>(pose.position.y),
+        static_cast<float>(pose.position.z)
+      };
+      backtrack_waypoints_.push_back(waypoint);
+    }
+    backtrack_waypoint_idx_ = 0;
+    
+    // Start planning through backtrack waypoints
+    if (!is_planning) {
+      is_planning = true;
+      plan_backtrack_sequence();
+      is_planning = false;
+    }
+  }
+
+  /**
    * Try planning to each frontier candidate in order
    */
-  void plan_to_best_frontier()
+  void RRT3DNode::plan_to_best_frontier()
   {
     for (size_t i = 0; i < frontier_candidates_.size(); ++i) {
       const auto& frontier = frontier_candidates_[i];
@@ -193,12 +213,12 @@ private:
       RCLCPP_INFO(get_logger(), "Trying frontier %zu: (%.2f, %.2f, %.2f)", 
                   i, frontier[0], frontier[1], frontier[2]);
       
-      // Safety validation: check if point is inside an obstacle
+      // Safety validation: use relaxed radius for frontiers (they're inherently near unknown space)
+      // The drone path itself still uses the full safety_radius_ (6m) so the drone stays safe
       if (current_octree_) {
-        octomap::point3d goal_point(frontier[0], frontier[1], frontier[2]);
-        octomap::OcTreeNode* node = current_octree_->search(goal_point);
-        if (node && node->getOccupancy() > occupied_threshold_) {
-          RCLCPP_WARN(get_logger(), "Frontier %zu is inside an obstacle, trying next", i);
+        std::vector<float> frontier_pos = {frontier[0], frontier[1], frontier[2]};
+        if (is_in_collision(frontier_pos, frontier_safety_radius_)) {
+          RCLCPP_WARN(get_logger(), "Frontier %zu is inside/too close to obstacle (frontier_radius=%.1f), trying next", i, frontier_safety_radius_);
           continue;
         }
       }
@@ -223,12 +243,79 @@ private:
   }
 
   /**
+   * Plan through backtrack waypoints sequentially
+   * 
+   * Starting from backtrack_waypoint_idx_, tries to plan an RRT path
+   * to the next backtrack waypoint. Skips waypoints that are too close
+   * to the drone or that can't be reached. If a waypoint is in collision,
+   * it tries the next one.
+   */
+  void RRT3DNode::plan_backtrack_sequence()
+  {
+    while (backtrack_waypoint_idx_ < backtrack_waypoints_.size()) {
+      const auto& waypoint = backtrack_waypoints_[backtrack_waypoint_idx_];
+      
+      // Skip waypoints that are very close to current position
+      float dist_to_wp = sqrt(
+        pow(start_position[0] - waypoint[0], 2) +
+        pow(start_position[1] - waypoint[1], 2) +
+        pow(start_position[2] - waypoint[2], 2)
+      );
+      
+      if (dist_to_wp < goal_tolerance * 2.0f) {
+        RCLCPP_INFO(get_logger(), "[BACKTRACK] Waypoint %zu too close (%.1fm), skipping",
+                    backtrack_waypoint_idx_, dist_to_wp);
+        backtrack_waypoint_idx_++;
+        continue;
+      }
+      
+      // Check if waypoint is safe
+      if (current_octree_ && is_in_collision(backtrack_waypoints_[backtrack_waypoint_idx_])) {
+        RCLCPP_WARN(get_logger(), "[BACKTRACK] Waypoint %zu in collision, skipping",
+                    backtrack_waypoint_idx_);
+        backtrack_waypoint_idx_++;
+        continue;
+      }
+      
+      RCLCPP_INFO(get_logger(), "[BACKTRACK] Planning to waypoint %zu/%zu: (%.2f, %.2f, %.2f)",
+                  backtrack_waypoint_idx_, backtrack_waypoints_.size(),
+                  waypoint[0], waypoint[1], waypoint[2]);
+      
+      // Set this waypoint as the RRT goal
+      goal_position = waypoint;
+      has_goal = true;
+      
+      bool success = plan_path();
+      
+      if (success) {
+        RCLCPP_INFO(get_logger(), "[BACKTRACK] Successfully planned to waypoint %zu", 
+                    backtrack_waypoint_idx_);
+        return;  // trajectory_publishing_loop will handle reaching it and calling back
+      } else {
+        RCLCPP_WARN(get_logger(), "[BACKTRACK] Failed to plan to waypoint %zu, skipping",
+                    backtrack_waypoint_idx_);
+        backtrack_waypoint_idx_++;
+      }
+    }
+    
+    // If we've exhausted all waypoints without success
+    RCLCPP_WARN(get_logger(), "[BACKTRACK] Could not plan to any remaining backtrack waypoints");
+    backtrack_mode_ = false;
+    goal_active_ = false;
+    
+    // Signal completion anyway so local planner can resume
+    std_msgs::msg::Bool complete_msg;
+    complete_msg.data = true;
+    backtrack_complete_publisher_->publish(complete_msg);
+  }
+
+  /**
    * Callback for odometry/position subscriber
    * 
    * Called whenever drone position is updated.
    * Updates the start position for RRT planning.
    */
-  void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
+  void RRT3DNode::odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
     // Update current drone position as RRT start
     start_position[0] = msg->pose.pose.position.x;
@@ -238,17 +325,47 @@ private:
 
   /**
    * Check if a point is in collision with obstacles
+   * Uses safety_radius_ to ensure the drone has clearance around the point
    */
-  bool is_in_collision(const std::vector<float>& position)
+  bool RRT3DNode::is_in_collision(const std::vector<float>& position)
   {
     if (!current_octree_) return false;
     
     octomap::point3d point(position[0], position[1], position[2]);
-    octomap::OcTreeNode* node = current_octree_->search(point);
     
-    // Point is occupied
-    if (node && node->getOccupancy() > occupied_threshold_) {
-      return true;
+    // Check safety radius: ensure no occupied voxels within safety_radius_ of point
+    // The bounding box already constrains to safety_radius_, so any occupied leaf is a collision
+    octomap::point3d min_pt = point - octomap::point3d(safety_radius_, safety_radius_, safety_radius_);
+    octomap::point3d max_pt = point + octomap::point3d(safety_radius_, safety_radius_, safety_radius_);
+    
+    for (auto it = current_octree_->begin_leafs_bbx(min_pt, max_pt); 
+         it != current_octree_->end_leafs_bbx(); ++it) {
+      if (it->getOccupancy() > occupied_threshold_) {
+        return true;
+      }
+    }
+    
+    return false;
+  }
+
+  /**
+   * Check if a point is in collision with obstacles using a custom safety radius
+   */
+  bool RRT3DNode::is_in_collision(const std::vector<float>& position, float radius)
+  {
+    if (!current_octree_) return false;
+    
+    octomap::point3d point(position[0], position[1], position[2]);
+    
+    // Check custom radius: ensure no occupied voxels within radius of point
+    octomap::point3d min_pt = point - octomap::point3d(radius, radius, radius);
+    octomap::point3d max_pt = point + octomap::point3d(radius, radius, radius);
+    
+    for (auto it = current_octree_->begin_leafs_bbx(min_pt, max_pt); 
+         it != current_octree_->end_leafs_bbx(); ++it) {
+      if (it->getOccupancy() > occupied_threshold_) {
+        return true;
+      }
     }
     
     return false;
@@ -256,13 +373,13 @@ private:
 
   /**
    * Check if edge between two points is collision-free
-   * Uses discrete sampling along the edge
+   * Uses discrete sampling along the edge with safety_radius_ clearance at each sample
    */
-  bool is_edge_collision_free(const std::vector<float>& from, const std::vector<float>& to)
+  bool RRT3DNode::is_edge_collision_free(const std::vector<float>& from, const std::vector<float>& to)
   {
     if (!current_octree_) return true;
     
-    // Sample along the edge at resolution intervals
+    // Sample along the edge at dense intervals
     float dx = to[0] - from[0];
     float dy = to[1] - from[1];
     float dz = to[2] - from[2];
@@ -270,7 +387,8 @@ private:
     
     if (dist < 0.01) return true;
     
-    int num_samples = std::max(2, static_cast<int>(dist / 1.0)); // Sample every 1.0m (less dense)
+    // Sample every 1.0m — safety_radius_ (4.0m) ensures full coverage between samples
+    int num_samples = std::max(2, static_cast<int>(dist / 1.0));
     
     for (int i = 0; i <= num_samples; ++i) {
       float t = static_cast<float>(i) / num_samples;
@@ -280,6 +398,7 @@ private:
         from[2] + t * dz
       };
       
+      // is_in_collision now checks safety_radius_ around each sample point
       if (is_in_collision(sample)) {
         return false;
       }
@@ -288,70 +407,114 @@ private:
     return true;
   }
 
+
   /**
    * Continuous trajectory publishing loop
    * Publishes trajectory commands at 10Hz to keep controller active
    * Follows waypoints from the planned RRT path
    */
-  void trajectory_publishing_loop()
+  void RRT3DNode::trajectory_publishing_loop()
   {
     if (!goal_active_ || current_path_.empty()) return;
+    if (current_waypoint_idx_ >= current_path_.size()) return;
     
-    // Get current waypoint
+    // First: advance past any waypoints we're already close to
+    while (current_waypoint_idx_ < current_path_.size()) {
+      const auto& wp = current_path_[current_waypoint_idx_];
+      double dist = sqrt(
+        pow(start_position[0] - wp[0], 2) +
+        pow(start_position[1] - wp[1], 2) +
+        pow(start_position[2] - wp[2], 2)
+      );
+      if (dist < goal_tolerance) {
+        RCLCPP_INFO(get_logger(), "Waypoint %zu reached (dist=%.1f), advancing", current_waypoint_idx_, dist);
+        current_waypoint_idx_++;
+      } else {
+        break;
+      }
+    }
+    
+    // Check if we've completed the entire path
     if (current_waypoint_idx_ >= current_path_.size()) {
-      RCLCPP_INFO(get_logger(), "Reached end of path");
-      goal_active_ = false;
+        
+      if (backtrack_mode_) {
+        // In backtrack mode: advance to next backtrack waypoint
+        backtrack_waypoint_idx_++;
+        
+        if (backtrack_waypoint_idx_ >= backtrack_waypoints_.size()) {
+          RCLCPP_INFO(get_logger(), "[BACKTRACK] All backtrack waypoints reached! Signaling completion.");
+          backtrack_mode_ = false;
+          goal_active_ = false;
+          
+          std_msgs::msg::Bool complete_msg;
+          complete_msg.data = true;
+          backtrack_complete_publisher_->publish(complete_msg);
+        } else {
+          RCLCPP_INFO(get_logger(), "[BACKTRACK] Segment complete, planning to waypoint %zu/%zu",
+                      backtrack_waypoint_idx_, backtrack_waypoints_.size());
+          goal_active_ = false;
+          
+          if (!is_planning) {
+            is_planning = true;
+            plan_backtrack_sequence();
+            is_planning = false;
+          }
+        }
+      } else {
+        RCLCPP_INFO(get_logger(), "Reached final goal, ready for new frontiers");
+        goal_active_ = false;  // Allow new frontier goals to trigger re-planning
+      }
       return;
     }
     
-    auto& waypoint = current_path_[current_waypoint_idx_];
-    
-    // Publish trajectory command to current waypoint
+    // Publish trajectory: current target waypoint + look-ahead waypoints
     trajectory_msgs::msg::MultiDOFJointTrajectory trajectory_msg;
     trajectory_msg.header.stamp = this->get_clock()->now();
     trajectory_msg.header.frame_id = "world";
     trajectory_msg.joint_names.push_back("base_link");
 
-    trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
-    geometry_msgs::msg::Transform transform;
-    transform.translation.x = waypoint[0];
-    transform.translation.y = waypoint[1];
-    transform.translation.z = waypoint[2];
-    
-    // Calculate yaw toward waypoint
-    double dx = waypoint[0] - start_position[0];
-    double dy = waypoint[1] - start_position[1];
-    double yaw = atan2(dy, dx);
-    double cy = cos(yaw * 0.5);
-    double sy = sin(yaw * 0.5);
-    
-    transform.rotation.x = 0.0;
-    transform.rotation.y = 0.0;
-    transform.rotation.z = sy;
-    transform.rotation.w = cy;
+    for (size_t i = current_waypoint_idx_; i < current_path_.size(); ++i) {
+      const auto& waypoint = current_path_[i];
+      
+      trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
+      geometry_msgs::msg::Transform transform;
+      transform.translation.x = waypoint[0];
+      transform.translation.y = waypoint[1];
+      transform.translation.z = waypoint[2];
+      
+      // Calculate yaw toward next waypoint
+      double yaw = 0.0;
+      if (i + 1 < current_path_.size()) {
+        const auto& next_wp = current_path_[i + 1];
+        double dx = next_wp[0] - waypoint[0];
+        double dy = next_wp[1] - waypoint[1];
+        yaw = atan2(dy, dx);
+      } else if (i > 0) {
+        const auto& prev_wp = current_path_[i - 1];
+        double dx = waypoint[0] - prev_wp[0];
+        double dy = waypoint[1] - prev_wp[1];
+        yaw = atan2(dy, dx);
+      }
+      
+      double cy = cos(yaw * 0.5);
+      double sy = sin(yaw * 0.5);
+      
+      transform.rotation.x = 0.0;
+      transform.rotation.y = 0.0;
+      transform.rotation.z = sy;
+      transform.rotation.w = cy;
 
-    point.transforms.push_back(transform);
+      point.transforms.push_back(transform);
 
-    // Zero velocities and accelerations (waypoint mode)
-    geometry_msgs::msg::Twist velocity;
-    geometry_msgs::msg::Twist acceleration;
-    point.velocities.push_back(velocity);
-    point.accelerations.push_back(acceleration);
+      geometry_msgs::msg::Twist velocity;
+      geometry_msgs::msg::Twist acceleration;
+      point.velocities.push_back(velocity);
+      point.accelerations.push_back(acceleration);
 
-    trajectory_msg.points.push_back(point);
-    trajectory_publisher_->publish(trajectory_msg);
-    
-    // Check if waypoint reached
-    double dist = sqrt(
-      pow(start_position[0] - waypoint[0], 2) +
-      pow(start_position[1] - waypoint[1], 2) +
-      pow(start_position[2] - waypoint[2], 2)
-    );
-    
-    if (dist < goal_tolerance) {
-      RCLCPP_INFO(get_logger(), "Waypoint %zu reached, moving to next", current_waypoint_idx_);
-      current_waypoint_idx_++;
+      trajectory_msg.points.push_back(point);
     }
+    
+    trajectory_publisher_->publish(trajectory_msg);
   }
 
   /**
@@ -361,13 +524,20 @@ private:
    * Generates a path from current position to goal.
    * Returns true if path found, false otherwise.
    */
-  bool plan_path()
+  bool RRT3DNode::plan_path()
   {
     RCLCPP_INFO(get_logger(), "Planning RRT from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)",
                 start_position[0], start_position[1], start_position[2],
                 goal_position[0], goal_position[1], goal_position[2]);
 
     auto start_time = this->now();
+    const double time_limit = 3.0; // seconds
+    
+    // Diagnostic counters
+    int random_collision_rejections = 0;
+    int node_collision_rejections = 0;
+    int edge_collision_rejections = 0;
+    int successful_extensions = 0;
 
     // Initialize tree with current position
     TreeNode *root_node = new TreeNode(start_position, nullptr);
@@ -379,23 +549,90 @@ private:
     }
     node_list = {root_node};
     
+    // Check if goal itself is reachable (collision-free with appropriate radius)
+    std::vector<float> goal_pos = {goal_position[0], goal_position[1], goal_position[2]};
+    if (is_in_collision(goal_pos, frontier_safety_radius_)) {
+      RCLCPP_WARN(get_logger(), "PLANNING FAILED: Goal position (%.2f, %.2f, %.2f) is in collision (radius=%.1fm)",
+                  goal_position[0], goal_position[1], goal_position[2], frontier_safety_radius_);
+      goal_active_ = false;
+      return false;
+    }
+    
+    // DEBUG: Check octree availability and size
+    if (!current_octree_) {
+      RCLCPP_ERROR(get_logger(), "PLANNING FAILED: No octree available!");
+      goal_active_ = false;
+      return false;
+    }
+    RCLCPP_INFO(get_logger(), "Octree available with %zu nodes, resolution=%.3fm", 
+                current_octree_->getNumLeafNodes(), current_octree_->getResolution());
+    
     // RRT main loop: expand tree until goal found or node limit/time reached
-    while (node_list.size() < node_limit && (this->now() - start_time).nanoseconds() / 1e9 < 2.0)
+    int debug_sample_count = 0; // Log first few samples for debugging
+    
+    while (node_list.size() < node_limit && (this->now() - start_time).nanoseconds() / 1e9 < time_limit)
     {
       // Step 1: Generate random point in configuration space
-      // Use goal-biased sampling (30% toward goal for faster convergence)
+      // Sample within cylindrical tube between start and goal
       float rand_x, rand_y, rand_z;
-      if ((rand() % 100) < 30) {
-        // Bias toward goal
-        rand_x = goal_position[0];
-        rand_y = goal_position[1];
-        rand_z = goal_position[2];
+
+      // Calculate direction vector from start to goal
+      float dx = goal_position[0] - start_position[0];
+      float dy = goal_position[1] - start_position[1]; 
+      float dz = goal_position[2] - start_position[2];
+      float goal_distance = sqrt(dx*dx + dy*dy + dz*dz);
+      
+      if (goal_distance < 0.1) {
+        // Goal is very close, use small radius around goal
+        rand_x = goal_position[0] + (rand() % 21 - 10);
+        rand_y = goal_position[1] + (rand() % 21 - 10);
+        rand_z = goal_position[2] + (rand() % 11 - 5);
       } else {
-        // Random sampling in reasonable bounds
-        rand_x = start_position[0] + (rand() % 200 - 100);
-        rand_y = start_position[1] + (rand() % 200 - 100);
-        rand_z = start_position[2] + (rand() % 20 - 10);
+        // Sample along the tube from start to goal
+        float t = (float)(rand() % 101) / 100.0f;  // Random position along tube [0,1]
+        float tube_radius = 15.0f; // Tube radius in meters
+        
+        // Point along center line between start and goal
+        float center_x = start_position[0] + t * dx;
+        float center_y = start_position[1] + t * dy;
+        float center_z = start_position[2] + t * dz;
+        
+        // Add random offset within tube radius (simplified approach)
+        float offset_x = (rand() % (int)(2*tube_radius*100) - tube_radius*100) / 100.0f;
+        float offset_y = (rand() % (int)(2*tube_radius*100) - tube_radius*100) / 100.0f;
+        float offset_z = (rand() % (int)(2*tube_radius*100) - tube_radius*100) / 100.0f;
+        
+        rand_x = center_x + offset_x;
+        rand_y = center_y + offset_y; 
+        rand_z = center_z + offset_z;
       }
+      
+      // DEBUG: Log tube sampling for first few iterations
+      if (debug_sample_count < 3) {
+        RCLCPP_INFO(get_logger(), "Tube sample %d: goal_dist=%.1fm, sampled at (%.1f,%.1f,%.1f)", 
+                    debug_sample_count, goal_distance, rand_x, rand_y, rand_z);
+      }
+      // Quick collision check on random sample (uses safety_radius_)
+      std::vector<float> rand_pos = {rand_x, rand_y, rand_z};
+      if (is_in_collision(rand_pos)) {
+        random_collision_rejections++;
+        
+        // DEBUG: Log first few sampling failures
+        if (debug_sample_count < 5) {
+          RCLCPP_WARN(get_logger(), "Sample %d REJECTED: (%.2f, %.2f, %.2f) in collision (radius=%.1fm)",
+                      debug_sample_count, rand_x, rand_y, rand_z, safety_radius_);
+        }
+        debug_sample_count++;
+        continue; // Skip random points inside or too close to obstacles
+      }
+      
+      // DEBUG: Log first few successful samples
+      if (debug_sample_count < 5) {
+        RCLCPP_INFO(get_logger(), "Sample %d ACCEPTED: (%.2f, %.2f, %.2f)",
+                    debug_sample_count, rand_x, rand_y, rand_z);
+      }
+      debug_sample_count++;
+      
       
       float min_distance = INFINITY;
       std::vector<float> min_node_vec;
@@ -431,7 +668,7 @@ private:
           // Downsample path: keep every Nth waypoint to reduce trajectory points
           current_path_.clear();
           current_waypoint_idx_ = 0;
-          int downsample_factor = 2;  // Keep every 2nd waypoint
+          int downsample_factor = 4;  // Keep every 4th waypoint
           for (size_t i = 0; i < full_path.size(); i += downsample_factor) {
             current_path_.push_back(full_path[i]);
           }
@@ -442,6 +679,20 @@ private:
           
           RCLCPP_INFO(get_logger(), "Path has %zu waypoints (downsampled from %zu)", 
                       current_path_.size(), full_path.size());
+          
+          // Skip initial waypoints that are already within goal tolerance
+          while (current_waypoint_idx_ + 1 < current_path_.size()) {
+            double dist_to_wp = sqrt(
+              pow(start_position[0] - current_path_[current_waypoint_idx_][0], 2) +
+              pow(start_position[1] - current_path_[current_waypoint_idx_][1], 2) +
+              pow(start_position[2] - current_path_[current_waypoint_idx_][2], 2)
+            );
+            if (dist_to_wp < goal_tolerance) {
+              current_waypoint_idx_++;
+            } else {
+              break;
+            }
+          }
           
           // Set active goal for trajectory publishing
           current_goal_position_ = goal_position;
@@ -482,11 +733,13 @@ private:
       
       // Collision check: verify new node is collision-free
       if (is_in_collision(new_node_position)) {
+        node_collision_rejections++;
         continue;
       }
       
       // Edge validation: verify path from parent to new node is collision-free
       if (!is_edge_collision_free(nearest_node->val, new_node_position)) {
+        edge_collision_rejections++;
         continue;
       }
       
@@ -494,6 +747,7 @@ private:
       TreeNode *new_node = new TreeNode(new_node_position, nearest_node);
       nearest_node->add_child(new_node);
       node_list.push_back(new_node);
+      successful_extensions++;
 
       // Periodically visualize tree progress (every 200 nodes)
       if (node_list.size() % 200 == 0)
@@ -502,8 +756,37 @@ private:
       }
     }
     
-    // Node limit or time limit reached without finding path
-    RCLCPP_WARN(get_logger(), "Path not found within time or node limit");
+    // Planning failed - provide detailed diagnostics
+    auto elapsed_time = (this->now() - start_time).nanoseconds() / 1e9;
+    bool hit_time_limit = elapsed_time >= time_limit;
+    bool hit_node_limit = node_list.size() >= node_limit;
+    
+    RCLCPP_WARN(get_logger(), "PLANNING FAILED after %.2fs with %zu nodes:", elapsed_time, node_list.size());
+    
+    if (hit_time_limit) {
+      RCLCPP_WARN(get_logger(), "  ✗ Hit TIME LIMIT (%.1fs)", time_limit);
+    }
+    if (hit_node_limit) {
+      RCLCPP_WARN(get_logger(), "  ✗ Hit NODE LIMIT (%zu nodes)", node_limit);
+    }
+    
+    RCLCPP_WARN(get_logger(), "  Collision rejections: Random=%d, Node=%d, Edge=%d", 
+                random_collision_rejections, node_collision_rejections, edge_collision_rejections);
+    RCLCPP_WARN(get_logger(), "  Successful extensions: %d (%.1f%% success rate)",
+                successful_extensions, 
+                100.0 * successful_extensions / std::max(1, successful_extensions + node_collision_rejections + edge_collision_rejections));
+    
+    // Calculate distance to goal from nearest tree node
+    float min_goal_distance = INFINITY;
+    for (TreeNode *node : node_list) {
+      float dist = sqrt(pow(goal_position[0] - node->val[0], 2) + 
+                       pow(goal_position[1] - node->val[1], 2) + 
+                       pow(goal_position[2] - node->val[2], 2));
+      min_goal_distance = std::min(min_goal_distance, dist);
+    }
+    RCLCPP_WARN(get_logger(), "  Closest approach to goal: %.2fm (need <%.2fm)", 
+                min_goal_distance, goal_tolerance);
+    
     goal_active_ = false;
     return false;
   }
@@ -517,7 +800,7 @@ private:
    * - Start as green sphere
    * - Goal as red sphere
    */
-  void visualize_rrt_tree()
+  void RRT3DNode::visualize_rrt_tree()
   {
     visualization_msgs::msg::MarkerArray markers;
     int marker_id = 0;
@@ -609,7 +892,7 @@ private:
   /**
    * Visualize the final path as a thick line
    */
-  void visualize_path()
+  void RRT3DNode::visualize_path()
   {
     visualization_msgs::msg::Marker path_marker;
     path_marker.header.frame_id = "world";
@@ -641,7 +924,7 @@ private:
   /**
    * Visualize the downsampled waypoint path (the path being followed)
    */
-  void visualize_waypoint_path()
+  void RRT3DNode::visualize_waypoint_path()
   {
     visualization_msgs::msg::Marker waypoint_marker;
     waypoint_marker.header.frame_id = "world";
@@ -699,7 +982,7 @@ private:
    * Backtracks from the goal node through parent pointers to reconstruct
    * the full path, then publishes it as a nav_msgs::Path message.
    */
-  void publish_path()
+  void RRT3DNode::publish_path()
   {
     path.poses.clear();
     path.header.frame_id = "world";
@@ -720,7 +1003,8 @@ private:
     }
     path_publisher->publish(path);
   }
-};
+
+
 
 int main(int argc, char *argv[])
 {
