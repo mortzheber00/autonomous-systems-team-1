@@ -15,6 +15,9 @@
 #include <octomap_msgs/conversions.h>
 #include "TreeNode.h"
 #include <memory>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 /**
  * RRT3DNode - 3D Rapid Exploring Random Tree Planner with Safety Checks
@@ -42,8 +45,8 @@ class RRT3DNode : public rclcpp::Node
 {
 public:
   RRT3DNode()
-      : Node("RRT3DNode"), step_size(3.0), goal_tolerance(3.0), 
-        node_limit(500), safety_radius_(2.0), occupied_threshold_(0.5)
+      : Node("RRT3DNode"), step_size(3.0), goal_tolerance(2.0), 
+        node_limit(500), safety_radius_(4.0), occupied_threshold_(0.5)
   {
     // Create publisher for trajectory commands
     trajectory_publisher_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>("/command/trajectory", 10);
@@ -113,6 +116,10 @@ private:
   // Octomap for safety checks
   std::shared_ptr<octomap::OcTree> current_octree_;
   
+  // Threading and Synchronization
+  std::mutex planning_mutex_;               // Protects shared data (path, goal, etc.)
+  std::atomic<bool> is_planning_{false};    // Atomic flag for planning state
+  
   // RRT tree data structures
   std::vector<int> map_size = {10, 10, 10};  // Configuration space bounds (not used with octomap)
   std::vector<TreeNode *> node_list;         // All nodes in the tree
@@ -162,55 +169,72 @@ private:
     
     RCLCPP_INFO(get_logger(), "Received %zu frontier candidates", msg->poses.size());
     
-    // Store frontier candidates
-    frontier_candidates_.clear();
+    // Lock mutex to update frontier candidates safely
+    std::vector<std::vector<float>> candidates;
     for (const auto& pose : msg->poses) {
       std::vector<float> frontier = {
         static_cast<float>(pose.position.x),
         static_cast<float>(pose.position.y),
         static_cast<float>(pose.position.z)
       };
-      frontier_candidates_.push_back(frontier);
+      candidates.push_back(frontier);
     }
     
-    // Start planning if not already planning
-    if (!is_planning)
     {
-      is_planning = true;
-      plan_to_best_frontier();
-      is_planning = false;
+      std::lock_guard<std::mutex> lock(planning_mutex_);
+      frontier_candidates_ = candidates;
+    }
+    
+    // Start planning thread if not already planning
+    bool expected = false;
+    if (is_planning_.compare_exchange_strong(expected, true))
+    {
+       std::thread(&RRT3DNode::plan_to_best_frontier_thread, this).detach();
     }
   }
 
   /**
-   * Try planning to each frontier candidate in order
+   * Try planning to each frontier candidate in order (Thread Function)
    */
-  void plan_to_best_frontier()
+  void plan_to_best_frontier_thread()
   {
-    for (size_t i = 0; i < frontier_candidates_.size(); ++i) {
-      const auto& frontier = frontier_candidates_[i];
+    // Local copies of data to minimize locking time
+    std::vector<std::vector<float>> local_candidates;
+    std::vector<float> local_start;
+    
+    {
+        std::lock_guard<std::mutex> lock(planning_mutex_);
+        local_candidates = frontier_candidates_;
+        local_start = start_position;
+    }
+
+    for (size_t i = 0; i < local_candidates.size(); ++i) {
+      const auto& frontier = local_candidates[i];
       
       RCLCPP_INFO(get_logger(), "Trying frontier %zu: (%.2f, %.2f, %.2f)", 
                   i, frontier[0], frontier[1], frontier[2]);
       
       // Safety validation: check if point is inside an obstacle
-      if (current_octree_) {
+      // NOTE: current_octree_ is a shared_ptr, so it's relatively safe to access read-only
+      // providing the pointer swap is atomic, but for full safety we should copy the pointer locally
+      std::shared_ptr<octomap::OcTree> tree_snapshot = current_octree_;
+      
+      if (tree_snapshot) {
         octomap::point3d goal_point(frontier[0], frontier[1], frontier[2]);
-        octomap::OcTreeNode* node = current_octree_->search(goal_point);
+        octomap::OcTreeNode* node = tree_snapshot->search(goal_point);
         if (node && node->getOccupancy() > occupied_threshold_) {
           RCLCPP_WARN(get_logger(), "Frontier %zu is inside an obstacle, trying next", i);
           continue;
         }
       }
       
-      // Set this frontier as goal and try planning
-      goal_position = frontier;
-      has_goal = true;
-      
-      bool success = plan_path();
+      // Try planning
+      // We pass local goal and start to avoid accessing shared state in tight loops
+      bool success = plan_path_internal(local_start, frontier);
       
       if (success) {
         RCLCPP_INFO(get_logger(), "Successfully planned to frontier %zu", i);
+        is_planning_ = false;
         return;
       } else {
         RCLCPP_WARN(get_logger(), "Failed to plan to frontier %zu, trying next", i);
@@ -218,8 +242,17 @@ private:
     }
     
     RCLCPP_WARN(get_logger(), "Failed to plan to any of the %zu frontiers", 
-                frontier_candidates_.size());
+                local_candidates.size());
     goal_active_ = false;
+    is_planning_ = false;
+  }
+  
+  // Wrapper for consistency with old code calls (will follow soon)
+  void plan_to_best_frontier() {
+      bool expected = false;
+      if (is_planning_.compare_exchange_strong(expected, true)) {
+          std::thread(&RRT3DNode::plan_to_best_frontier_thread, this).detach();
+      }
   }
 
   /**
@@ -230,6 +263,7 @@ private:
    */
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg)
   {
+    std::lock_guard<std::mutex> lock(planning_mutex_);
     // Update current drone position as RRT start
     start_position[0] = msg->pose.pose.position.x;
     start_position[1] = msg->pose.pose.position.y;
@@ -238,17 +272,35 @@ private:
 
   /**
    * Check if a point is in collision with obstacles
+   * Checks a bounding box around the point defined by safety_radius_
    */
   bool is_in_collision(const std::vector<float>& position)
   {
     if (!current_octree_) return false;
     
-    octomap::point3d point(position[0], position[1], position[2]);
-    octomap::OcTreeNode* node = current_octree_->search(point);
+    // Define bounding box around position with safety_radius_
+    octomap::point3d min_pt(
+        position[0] - safety_radius_,
+        position[1] - safety_radius_,
+        position[2] - safety_radius_
+    );
     
-    // Point is occupied
-    if (node && node->getOccupancy() > occupied_threshold_) {
-      return true;
+    octomap::point3d max_pt(
+        position[0] + safety_radius_,
+        position[1] + safety_radius_,
+        position[2] + safety_radius_
+    );
+
+    // Iterate through leaf nodes in the bounding box
+    for(octomap::OcTree::leaf_bbx_iterator it = current_octree_->begin_leafs_bbx(min_pt, max_pt),
+        end = current_octree_->end_leafs_bbx(); it != end; ++it)
+    {
+        // specific distance check to ensure spherical safety zone (optional, box is faster)
+        if (it->getOccupancy() > occupied_threshold_) {
+           if (it.getCoordinate().distance(octomap::point3d(position[0], position[1], position[2])) <= safety_radius_) {
+             return true;
+           }
+        }
     }
     
     return false;
@@ -295,6 +347,8 @@ private:
    */
   void trajectory_publishing_loop()
   {
+    std::lock_guard<std::mutex> lock(planning_mutex_);
+    
     if (!goal_active_ || current_path_.empty()) return;
     
     // Get current waypoint
@@ -306,42 +360,74 @@ private:
     
     auto& waypoint = current_path_[current_waypoint_idx_];
     
-    // Publish trajectory command to current waypoint
+    // Publish trajectory command containing the remaining path
     trajectory_msgs::msg::MultiDOFJointTrajectory trajectory_msg;
     trajectory_msg.header.stamp = this->get_clock()->now();
     trajectory_msg.header.frame_id = "world";
     trajectory_msg.joint_names.push_back("base_link");
 
-    trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
-    geometry_msgs::msg::Transform transform;
-    transform.translation.x = waypoint[0];
-    transform.translation.y = waypoint[1];
-    transform.translation.z = waypoint[2];
+    // Add all remaining waypoints to the trajectory
+    // We assume a constant speed to calculate roughly when we should be at each point
+    double desired_velocity = 5.0; // m/s
+    double current_time_offset = 0.0;
     
-    // Calculate yaw toward waypoint
-    double dx = waypoint[0] - start_position[0];
-    double dy = waypoint[1] - start_position[1];
-    double yaw = atan2(dy, dx);
-    double cy = cos(yaw * 0.5);
-    double sy = sin(yaw * 0.5);
+    std::vector<float> prev_pos = start_position;
     
-    transform.rotation.x = 0.0;
-    transform.rotation.y = 0.0;
-    transform.rotation.z = sy;
-    transform.rotation.w = cy;
+    // Iterate from current waypoint index to end
+    for (size_t i = current_waypoint_idx_; i < current_path_.size(); ++i) {
+        auto& pt = current_path_[i];
+        
+        trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
+        geometry_msgs::msg::Transform transform;
+        transform.translation.x = pt[0];
+        transform.translation.y = pt[1];
+        transform.translation.z = pt[2];
+        
+        // Calculate yaw toward next waypoint (or keep current if last)
+        double dx, dy;
+        if (i + 1 < current_path_.size()) {
+            dx = current_path_[i+1][0] - pt[0];
+            dy = current_path_[i+1][1] - pt[1];
+        } else {
+            // For relevant yaw at the end, use the vector from previous point
+            dx = pt[0] - prev_pos[0];
+            dy = pt[1] - prev_pos[1];
+        }
+        
+        // Compute distance from previous point to update time
+        double dist_segment = sqrt(pow(pt[0] - prev_pos[0], 2) + 
+                                   pow(pt[1] - prev_pos[1], 2) + 
+                                   pow(pt[2] - prev_pos[2], 2));
+        current_time_offset += dist_segment / desired_velocity;
+        
+        // Set time_from_start
+        point.time_from_start = rclcpp::Duration::from_seconds(current_time_offset);
+        
+        double yaw = atan2(dy, dx);
+        double cy = cos(yaw * 0.5);
+        double sy = sin(yaw * 0.5);
+        
+        transform.rotation.x = 0.0;
+        transform.rotation.y = 0.0;
+        transform.rotation.z = sy;
+        transform.rotation.w = cy;
 
-    point.transforms.push_back(transform);
+        point.transforms.push_back(transform);
 
-    // Zero velocities and accelerations (waypoint mode)
-    geometry_msgs::msg::Twist velocity;
-    geometry_msgs::msg::Twist acceleration;
-    point.velocities.push_back(velocity);
-    point.accelerations.push_back(acceleration);
+        // Zero velocities and accelerations (waypoint mode)
+        geometry_msgs::msg::Twist velocity;
+        geometry_msgs::msg::Twist acceleration;
+        point.velocities.push_back(velocity);
+        point.accelerations.push_back(acceleration);
 
-    trajectory_msg.points.push_back(point);
+        trajectory_msg.points.push_back(point);
+        
+        prev_pos = pt;
+    }
+
     trajectory_publisher_->publish(trajectory_msg);
     
-    // Check if waypoint reached
+    // Check if current waypoint reached (local loop logic still applies for progress tracking)
     double dist = sqrt(
       pow(start_position[0] - waypoint[0], 2) +
       pow(start_position[1] - waypoint[1], 2) +
@@ -352,49 +438,79 @@ private:
       RCLCPP_INFO(get_logger(), "Waypoint %zu reached, moving to next", current_waypoint_idx_);
       current_waypoint_idx_++;
     }
+
+    // Check for collisions to current waypoint
+    if (goal_active_ && current_octree_) {
+      if (!is_edge_collision_free(start_position, waypoint)) {
+        RCLCPP_WARN(get_logger(), "Collision detected on path to current waypoint! Stopping and replanning...");
+        
+        // Stop the drone immediately
+        goal_active_ = false;  // Stop following old path
+        
+        // Publish stop command
+        trajectory_msgs::msg::MultiDOFJointTrajectory stop_msg;
+        stop_msg.header.stamp = this->get_clock()->now();
+        stop_msg.header.frame_id = "world";
+        stop_msg.joint_names.push_back("base_link");
+        
+        trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
+        geometry_msgs::msg::Transform transform;
+        transform.translation.x = start_position[0];
+        transform.translation.y = start_position[1];
+        transform.translation.z = start_position[2];
+        transform.rotation.w = 1.0; // Identity quaternion
+        
+        geometry_msgs::msg::Twist velocity; // Zero velocity
+        geometry_msgs::msg::Twist acceleration; // Zero acceleration
+        point.velocities.push_back(velocity);
+        point.accelerations.push_back(acceleration);
+        
+        point.transforms.push_back(transform);
+        stop_msg.points.push_back(point);
+        trajectory_publisher_->publish(stop_msg);
+
+        // Attempt to replan to a valid frontier
+        plan_to_best_frontier(); 
+        return;
+      }
+    }
   }
 
   /**
-   * Main RRT planning function
+   * Main RRT planning function (Internal usage)
    * 
-   * This is called whenever a new goal is received.
-   * Generates a path from current position to goal.
-   * Returns true if path found, false otherwise.
+   * Updates global path if successful.
    */
-  bool plan_path()
+  bool plan_path_internal(const std::vector<float>& start_pos, const std::vector<float>& goal_pos)
   {
     RCLCPP_INFO(get_logger(), "Planning RRT from (%.2f, %.2f, %.2f) to (%.2f, %.2f, %.2f)",
-                start_position[0], start_position[1], start_position[2],
-                goal_position[0], goal_position[1], goal_position[2]);
+                start_pos[0], start_pos[1], start_pos[2],
+                goal_pos[0], goal_pos[1], goal_pos[2]);
 
     auto start_time = this->now();
 
-    // Initialize tree with current position
-    TreeNode *root_node = new TreeNode(start_position, nullptr);
-    
-    // Clear previous tree
-    for (TreeNode *node : node_list)
-    {
-      delete node;
-    }
-    node_list = {root_node};
+    // Initialize tree with given start position
+    // Use local node list
+    std::vector<TreeNode *> local_nodes;
+    TreeNode *root = new TreeNode(start_pos, nullptr);
+    local_nodes.push_back(root);
     
     // RRT main loop: expand tree until goal found or node limit/time reached
-    while (node_list.size() < node_limit && (this->now() - start_time).nanoseconds() / 1e9 < 2.0)
+    while (local_nodes.size() < node_limit && (this->now() - start_time).nanoseconds() / 1e9 < 2.0)
     {
       // Step 1: Generate random point in configuration space
       // Use goal-biased sampling (30% toward goal for faster convergence)
       float rand_x, rand_y, rand_z;
       if ((rand() % 100) < 30) {
         // Bias toward goal
-        rand_x = goal_position[0];
-        rand_y = goal_position[1];
-        rand_z = goal_position[2];
+        rand_x = goal_pos[0];
+        rand_y = goal_pos[1];
+        rand_z = goal_pos[2];
       } else {
         // Random sampling in reasonable bounds
-        rand_x = start_position[0] + (rand() % 200 - 100);
-        rand_y = start_position[1] + (rand() % 200 - 100);
-        rand_z = start_position[2] + (rand() % 20 - 10);
+        rand_x = start_pos[0] + (rand() % 200 - 100);
+        rand_y = start_pos[1] + (rand() % 200 - 100);
+        rand_z = start_pos[2] + (rand() % 20 - 10);
       }
       
       float min_distance = INFINITY;
@@ -402,12 +518,12 @@ private:
       TreeNode *nearest_node;
       
       // Step 2: Find nearest node in tree to random point
-      for (TreeNode *node : node_list)
+      for (TreeNode *node : local_nodes)
       {
         // Check if this node is close enough to goal
-        std::vector<float> goal_vec = {goal_position[0] - node->val[0],
-                                       goal_position[1] - node->val[1],
-                                       goal_position[2] - node->val[2]};
+        std::vector<float> goal_vec = {goal_pos[0] - node->val[0],
+                                       goal_pos[1] - node->val[1],
+                                       goal_pos[2] - node->val[2]};
         const float goal_distance = sqrt(pow(goal_vec[0], 2) +
                                          pow(goal_vec[1], 2) +
                                          pow(goal_vec[2], 2));
@@ -415,9 +531,9 @@ private:
         // Check if close enough to goal
         if (goal_distance < goal_tolerance) {
           // Create goal node
-          TreeNode *goal_node = new TreeNode(goal_position, node);
+          TreeNode *goal_node = new TreeNode(goal_pos, node);
           node->add_child(goal_node);
-          node_list.push_back(goal_node);
+          local_nodes.push_back(goal_node);
           RCLCPP_INFO(get_logger(), "Path found!");
           
           // Extract waypoints from path (from start to goal)
@@ -429,29 +545,43 @@ private:
           }
           
           // Downsample path: keep every Nth waypoint to reduce trajectory points
-          current_path_.clear();
-          current_waypoint_idx_ = 0;
+          std::vector<std::vector<float>> downsampled_path;
           int downsample_factor = 2;  // Keep every 2nd waypoint
           for (size_t i = 0; i < full_path.size(); i += downsample_factor) {
-            current_path_.push_back(full_path[i]);
+            downsampled_path.push_back(full_path[i]);
           }
           // Always include the final goal
-          if (current_path_.empty() || current_path_.back() != full_path.back()) {
-            current_path_.push_back(full_path.back());
+          if (downsampled_path.empty() || downsampled_path.back() != full_path.back()) {
+            downsampled_path.push_back(full_path.back());
           }
           
           RCLCPP_INFO(get_logger(), "Path has %zu waypoints (downsampled from %zu)", 
-                      current_path_.size(), full_path.size());
+                      downsampled_path.size(), full_path.size());
           
-          // Set active goal for trajectory publishing
-          current_goal_position_ = goal_position;
-          goal_active_ = true;
+          // Update shared state safely
+          {
+              std::lock_guard<std::mutex> lock(planning_mutex_);
+              
+              // Clear old visualization nodes
+              for (TreeNode *node : node_list) {
+                delete node;
+              }
+              // Transfer ownership of new nodes
+              node_list = local_nodes;
+              
+              current_path_ = downsampled_path;
+              current_goal_position_ = goal_pos;
+              goal_position = goal_pos;
+              current_waypoint_idx_ = 0;
+              goal_active_ = true;
+          }
           
+          // Visualize (accessing member variables which are now updated)
           visualize_rrt_tree();   // Show the complete tree
           visualize_path();       // Show the final path
           visualize_waypoint_path();  // Show the downsampled waypoint path
           publish_path();
-          return true;
+          return true; // Success
         }
         
         // Calculate distance from node to random point
@@ -493,18 +623,17 @@ private:
       // Create new node and add to tree
       TreeNode *new_node = new TreeNode(new_node_position, nearest_node);
       nearest_node->add_child(new_node);
-      node_list.push_back(new_node);
-
-      // Periodically visualize tree progress (every 200 nodes)
-      if (node_list.size() % 200 == 0)
-      {
-        visualize_rrt_tree();
-      }
+      local_nodes.push_back(new_node);
     }
     
+    // Clean up local nodes if failed
+    for (TreeNode *node : local_nodes) {
+        delete node;
+    }
+
     // Node limit or time limit reached without finding path
     RCLCPP_WARN(get_logger(), "Path not found within time or node limit");
-    goal_active_ = false;
+    // goal_active_ = false; // logic handled by caller or existing state
     return false;
   }
 

@@ -61,7 +61,7 @@ public:
 
     // Timer: Run planning loop at 2 Hz (500ms)
     planning_timer_ = create_wall_timer(
-        std::chrono::milliseconds(500),
+        std::chrono::milliseconds(2000),
         std::bind(&LocalPlannerNode::planning_loop, this)
     );
     
@@ -323,20 +323,25 @@ private:
     if (total_voxels == 0) return 0.0;
     float volume_gain = static_cast<float>(unknown_voxels) / static_cast<float>(total_voxels);
     
-    // Add penalty for being too close to obstacles (encourage center of passage)
-    float min_obstacle_dist = 10.0f; // Start with large distance
+    // Add penalty for being too close to obstacles (encourage center of free space)
+    float min_obstacle_dist = 20.0f; // Start with large distance
     octomap::point3d end_point;
     
-    // Check distance to obstacles in 6 cardinal directions
-    octomap::point3d directions[6] = {
-        octomap::point3d(1, 0, 0), octomap::point3d(-1, 0, 0),
-        octomap::point3d(0, 1, 0), octomap::point3d(0, -1, 0),
-        octomap::point3d(0, 0, 1), octomap::point3d(0, 0, -1)
-    };
+    // Check distance to obstacles in 26 directions (more robust than just cardinal)
+    std::vector<octomap::point3d> directions;
+    for(int x=-1; x<=1; x++) {
+      for(int y=-1; y<=1; y++) {
+        for(int z=-1; z<=1; z++) {
+          if(x==0 && y==0 && z==0) continue;
+          directions.push_back(octomap::point3d(x, y, z));
+        }
+      }
+    }
     
     for (const auto& dir : directions) {
         // Cast ray to find nearest obstacle in each direction
-        if (octree->castRay(point, dir, end_point, true, 10.0)) {
+        // Increased range to 20.0 to better find centers in large spaces
+        if (octree->castRay(point, dir, end_point, true, 20.0)) {
             float dist = (end_point - point).norm();
             if (dist < min_obstacle_dist) {
                 min_obstacle_dist = dist;
@@ -345,8 +350,14 @@ private:
     }
     
     // Reward points that are further from walls (centered in passages)
-    // Linear scaling: 0.5 at wall (0m) to 1.0 at center (5m or more)
-    float centering_bonus = std::min(1.0f, 0.5f + 0.1f * min_obstacle_dist);
+    // Penalize frontiers close to walls (user requirement: < 4m)
+    if (min_obstacle_dist < 4.0f) {
+      return volume_gain * 0.001f; // Heavy penalty to effectively ignore them
+    }
+
+    // Use distance heavily in score to push towards center
+    // We remove the cap at 1.0 so points further away get higher scores
+    float centering_bonus = min_obstacle_dist;
     
     return volume_gain * centering_bonus;
   }
