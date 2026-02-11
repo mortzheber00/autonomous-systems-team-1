@@ -45,8 +45,8 @@ class RRT3DNode : public rclcpp::Node
 {
 public:
   RRT3DNode()
-      : Node("RRT3DNode"), step_size(3.0), goal_tolerance(2.0), 
-        node_limit(500), safety_radius_(4.0), occupied_threshold_(0.5)
+      : Node("RRT3DNode"), step_size(2.0), goal_tolerance(2.0), 
+        node_limit(5000), safety_radius_(4.0), occupied_threshold_(0.5)
   {
     // Create publisher for trajectory commands
     trajectory_publisher_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>("/command/trajectory", 10);
@@ -115,6 +115,7 @@ private:
   
   // Octomap for safety checks
   std::shared_ptr<octomap::OcTree> current_octree_;
+  std::mutex octomap_mutex_; // Protects current_octree_ access
   
   // Threading and Synchronization
   std::mutex planning_mutex_;               // Protects shared data (path, goal, etc.)
@@ -146,6 +147,7 @@ private:
     if (tree) {
         octomap::OcTree* octree = dynamic_cast<octomap::OcTree*>(tree);
         if (octree) {
+            std::lock_guard<std::mutex> lock(octomap_mutex_);
             current_octree_ = std::shared_ptr<octomap::OcTree>(octree);
         } else {
             RCLCPP_ERROR(get_logger(), "Octomap message was not an OcTree");
@@ -217,7 +219,11 @@ private:
       // Safety validation: check if point is inside an obstacle
       // NOTE: current_octree_ is a shared_ptr, so it's relatively safe to access read-only
       // providing the pointer swap is atomic, but for full safety we should copy the pointer locally
-      std::shared_ptr<octomap::OcTree> tree_snapshot = current_octree_;
+      std::shared_ptr<octomap::OcTree> tree_snapshot;
+      {
+           std::lock_guard<std::mutex> lock(octomap_mutex_);
+           tree_snapshot = current_octree_;
+      }
       
       if (tree_snapshot) {
         octomap::point3d goal_point(frontier[0], frontier[1], frontier[2]);
@@ -273,31 +279,52 @@ private:
   /**
    * Check if a point is in collision with obstacles
    * Checks a bounding box around the point defined by safety_radius_
+   * Optional start_pos allows for reduced safety radius near the start
    */
-  bool is_in_collision(const std::vector<float>& position)
+  bool is_in_collision(const std::vector<float>& position, const std::vector<float>& start_pos = {})
   {
-    if (!current_octree_) return false;
+    std::shared_ptr<octomap::OcTree> tree_ptr;
+    {
+        std::lock_guard<std::mutex> lock(octomap_mutex_);
+        tree_ptr = current_octree_;
+    }
     
-    // Define bounding box around position with safety_radius_
+    if (!tree_ptr) return false;
+    
+    // Determine effective safety radius
+    float effective_radius = safety_radius_;
+    if (!start_pos.empty()) {
+        float dist = sqrt(pow(position[0]-start_pos[0], 2) + 
+                          pow(position[1]-start_pos[1], 2) + 
+                          pow(position[2]-start_pos[2], 2));
+                          
+        // Linearly reduce safety radius near start position
+        // From 0.5m at start to full safety_radius_ at distance >= safety_radius_
+        if (dist < safety_radius_) {
+             effective_radius = 0.5f + (dist / safety_radius_) * (safety_radius_ - 0.5f);
+        }
+    }
+
+    // Define bounding box around position with effective_radius
     octomap::point3d min_pt(
-        position[0] - safety_radius_,
-        position[1] - safety_radius_,
-        position[2] - safety_radius_
+        position[0] - effective_radius,
+        position[1] - effective_radius,
+        position[2] - effective_radius
     );
     
     octomap::point3d max_pt(
-        position[0] + safety_radius_,
-        position[1] + safety_radius_,
-        position[2] + safety_radius_
+        position[0] + effective_radius,
+        position[1] + effective_radius,
+        position[2] + effective_radius
     );
 
     // Iterate through leaf nodes in the bounding box
-    for(octomap::OcTree::leaf_bbx_iterator it = current_octree_->begin_leafs_bbx(min_pt, max_pt),
-        end = current_octree_->end_leafs_bbx(); it != end; ++it)
+    for(octomap::OcTree::leaf_bbx_iterator it = tree_ptr->begin_leafs_bbx(min_pt, max_pt),
+        end = tree_ptr->end_leafs_bbx(); it != end; ++it)
     {
         // specific distance check to ensure spherical safety zone (optional, box is faster)
         if (it->getOccupancy() > occupied_threshold_) {
-           if (it.getCoordinate().distance(octomap::point3d(position[0], position[1], position[2])) <= safety_radius_) {
+           if (it.getCoordinate().distance(octomap::point3d(position[0], position[1], position[2])) <= effective_radius) {
              return true;
            }
         }
@@ -310,9 +337,15 @@ private:
    * Check if edge between two points is collision-free
    * Uses discrete sampling along the edge
    */
-  bool is_edge_collision_free(const std::vector<float>& from, const std::vector<float>& to)
+  bool is_edge_collision_free(const std::vector<float>& from, const std::vector<float>& to, const std::vector<float>& start_pos = {})
   {
-    if (!current_octree_) return true;
+    std::shared_ptr<octomap::OcTree> tree_ptr;
+    {
+        std::lock_guard<std::mutex> lock(octomap_mutex_);
+        tree_ptr = current_octree_;
+    }
+
+    if (!tree_ptr) return true;
     
     // Sample along the edge at resolution intervals
     float dx = to[0] - from[0];
@@ -332,7 +365,8 @@ private:
         from[2] + t * dz
       };
       
-      if (is_in_collision(sample)) {
+      // Pass start_pos to collision check to apply reduced radius if near start
+      if (is_in_collision(sample, start_pos)) {
         return false;
       }
     }
@@ -368,7 +402,7 @@ private:
 
     // Add all remaining waypoints to the trajectory
     // We assume a constant speed to calculate roughly when we should be at each point
-    double desired_velocity = 5.0; // m/s
+    double desired_velocity = 15.0; // m/s
     double current_time_offset = 0.0;
     
     std::vector<float> prev_pos = start_position;
@@ -441,7 +475,7 @@ private:
 
     // Check for collisions to current waypoint
     if (goal_active_ && current_octree_) {
-      if (!is_edge_collision_free(start_position, waypoint)) {
+      if (!is_edge_collision_free(start_position, waypoint, start_position)) {
         RCLCPP_WARN(get_logger(), "Collision detected on path to current waypoint! Stopping and replanning...");
         
         // Stop the drone immediately
@@ -499,9 +533,9 @@ private:
     while (local_nodes.size() < node_limit && (this->now() - start_time).nanoseconds() / 1e9 < 2.0)
     {
       // Step 1: Generate random point in configuration space
-      // Use goal-biased sampling (30% toward goal for faster convergence)
+      // Use goal-biased sampling (50% toward goal for straighter paths in free space)
       float rand_x, rand_y, rand_z;
-      if ((rand() % 100) < 30) {
+      if ((rand() % 100) < 80) {
         // Bias toward goal
         rand_x = goal_pos[0];
         rand_y = goal_pos[1];
@@ -611,12 +645,12 @@ private:
       std::vector<float> new_node_position = {new_node_x, new_node_y, new_node_z};
       
       // Collision check: verify new node is collision-free
-      if (is_in_collision(new_node_position)) {
+      if (is_in_collision(new_node_position, start_pos)) {
         continue;
       }
       
       // Edge validation: verify path from parent to new node is collision-free
-      if (!is_edge_collision_free(nearest_node->val, new_node_position)) {
+      if (!is_edge_collision_free(nearest_node->val, new_node_position, start_pos)) {
         continue;
       }
       
