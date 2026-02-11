@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>state_machine_pkg</name>
+  <version>0.0.0</version>
+  <description>High-level mission state machine for cave exploration</description>
+  <maintainer email="tom@example.com">tom</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_python</buildtool_depend>
+
+  <depend>rclpy</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>std_msgs</depend>
+  <depend>trajectory_msgs</depend>
+  <depend>visualization_msgs</depend>
+  <depend>ament_index_python</depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

@@ -25,6 +25,7 @@
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <vector>
 #include <cmath>
@@ -62,6 +63,11 @@ public:
       "/current_state_est", 10,
       std::bind(&LocalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
+
+    enable_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/state_machine/enable_local_planner", 1,
+      std::bind(&LocalPlannerNode::enable_callback, this, std::placeholders::_1)
+    );
     
     last_frontier_found_time_ = this->now();
 
@@ -89,6 +95,7 @@ private:
   rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr trajectory_publisher_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_subscription_;
   rclcpp::TimerBase::SharedPtr planning_timer_;
 
   // Data Storage
@@ -103,6 +110,7 @@ private:
   // State Machine for Goal Persistence
   bool goal_active_;
   geometry_msgs::msg::Point current_goal_;
+  bool local_planner_enabled_ = true;
 
   // Frontier info structure
   struct FrontierInfo {
@@ -161,6 +169,11 @@ private:
       msg->pose.pose.orientation.w);
   }
 
+  void enable_callback(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    local_planner_enabled_ = msg->data;
+  }
+
   void octomap_callback(const octomap_msgs::msg::Octomap::SharedPtr msg)
   {
     // Simply convert and store the tree.
@@ -187,6 +200,10 @@ private:
     if (!current_octree_) {
         RCLCPP_DEBUG(get_logger(), "Waiting for Octomap...");
         return;
+    }
+
+    if (!local_planner_enabled_) {
+      return;
     }
 
     bool need_new_goal = false;
