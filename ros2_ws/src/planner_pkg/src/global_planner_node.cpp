@@ -10,6 +10,7 @@
 
 #include <rclcpp/rclcpp.hpp>
 #include <geometry_msgs/msg/point.hpp>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/msg/path.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
@@ -22,7 +23,6 @@
 #include <vector>
 #include <algorithm>
 #include <memory>
-#include <sstream>
 
 /**
  * FrontierInfo - Structure to store frontier data
@@ -48,7 +48,7 @@ struct FrontierInfo {
  * 5. Commands backtracking when needed
  * 
  * ROS Interface (Subscribers):
- * - /frontier_goal (geometry_msgs/Point) - Local planner's frontier
+ * - /frontier_goals (geometry_msgs/PoseArray) - Local planner's frontiers
  * - /true_pose (nav_msgs/Odometry) - Current drone position and heading
  * - /path (nav_msgs/Path) - Path from RRT planner
  * 
@@ -70,8 +70,8 @@ public:
     
     // ----- Subscribers -----
     // Subscribe to frontier goals from local planner to build frontier list
-    frontier_subscription_ = create_subscription<geometry_msgs::msg::Point>(
-      "/frontier_goal", 10,
+    frontier_subscription_ = create_subscription<geometry_msgs::msg::PoseArray>(
+      "/frontier_goals", 10,
       std::bind(&GlobalPlannerNode::frontier_callback, this, std::placeholders::_1)
     );
     
@@ -110,7 +110,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr frontier_markers_publisher_;
   
   // Subscribers
-  rclcpp::Subscription<geometry_msgs::msg::Point>::SharedPtr frontier_subscription_;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr frontier_subscription_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
   
@@ -144,33 +144,38 @@ private:
    * Gains will be re-evaluated based on Octomap exploration gains.
    * Every 5 frontiers added, re-evaluates and prunes low-gain frontiers.
    */
-  void frontier_callback(const geometry_msgs::msg::Point::SharedPtr msg)
+  void frontier_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
   {
-    // Check if frontier is close to existing frontier
-    auto existing = find_nearby_frontier(*msg);
-    
-    if (existing != frontier_list_.end()) {
-      // Frontier already exists nearby - will be re-evaluated with Octomap
-      RCLCPP_INFO(get_logger(), "Frontier already in list (ID: %d) at distance %.2f. Skipping duplicate.",
-                   existing->id, distance(existing->position, *msg));
-    } else {
-      // Add new frontier if under limit
-      if (frontier_list_.size() < max_frontiers_) {
-        frontier_list_.emplace_back(*msg, 0.5, frontier_counter_++);
-        frontier_added_since_prune_++;
-        RCLCPP_INFO(get_logger(), "[FRONTIER] Added new frontier (ID: %d) at (%.2f, %.2f, %.2f). Total: %lu",
-                    frontier_counter_ - 1, msg->x, msg->y, msg->z, frontier_list_.size());
-        
-        // After every 5 new frontiers, re-evaluate gains and prune
-        if (frontier_added_since_prune_ >= prune_interval_) {
-          RCLCPP_INFO(get_logger(), "[PRUNE] Reached interval (%d frontiers added). Re-evaluating gains and pruning...",
-                      frontier_added_since_prune_);
-          prune_low_gain_frontiers();
-          frontier_added_since_prune_ = 0;
-        }
+    // Process each pose in the array
+    for (const auto& pose : msg->poses) {
+      geometry_msgs::msg::Point point = pose.position;
+      
+      // Check if frontier is close to existing frontier
+      auto existing = find_nearby_frontier(point);
+      
+      if (existing != frontier_list_.end()) {
+        // Frontier already exists nearby - will be re-evaluated with Octomap
+        RCLCPP_INFO(get_logger(), "Frontier already in list (ID: %d) at distance %.2f. Skipping duplicate.",
+                     existing->id, distance(existing->position, point));
       } else {
-        RCLCPP_WARN(get_logger(), "Frontier list at maximum size (%lu), skipping new frontier at (%.2f, %.2f, %.2f)", 
-                    frontier_list_.size(), msg->x, msg->y, msg->z);
+        // Add new frontier if under limit
+        if (frontier_list_.size() < max_frontiers_) {
+          frontier_list_.emplace_back(point, 0.5, frontier_counter_++);
+          frontier_added_since_prune_++;
+          RCLCPP_INFO(get_logger(), "[FRONTIER] Added new frontier (ID: %d) at (%.2f, %.2f, %.2f). Total: %lu",
+                      frontier_counter_ - 1, point.x, point.y, point.z, frontier_list_.size());
+          
+          // After every 5 new frontiers, re-evaluate gains and prune
+          if (frontier_added_since_prune_ >= prune_interval_) {
+            RCLCPP_INFO(get_logger(), "[PRUNE] Reached interval (%d frontiers added). Re-evaluating gains and pruning...",
+                        frontier_added_since_prune_);
+            prune_low_gain_frontiers();
+            frontier_added_since_prune_ = 0;
+          }
+        } else {
+          RCLCPP_WARN(get_logger(), "Frontier list at maximum size (%lu), skipping new frontier at (%.2f, %.2f, %.2f)", 
+                      frontier_list_.size(), point.x, point.y, point.z);
+        }
       }
     }
   }
@@ -335,19 +340,6 @@ private:
     RCLCPP_INFO(get_logger(), 
                "Published backtrack path: %lu flown points + frontier (ID: %d, Gain: %.2f) as target",
                flown_points_.size(), target_frontier->id, target_frontier->exploration_gain);
-  }
-
-  /**
-   * Update frontier status
-   * 
-   * Marks frontier as visited when drone reaches it.
-   * 
-   * @param frontier - Frontier to mark as visited
-   */
-  void mark_frontier_visited(FrontierInfo& frontier)
-  {
-    frontier.visited = true;
-    RCLCPP_INFO(get_logger(), "Marked frontier %d as visited", frontier.id);
   }
 
   /**

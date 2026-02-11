@@ -13,6 +13,10 @@ find_package(std_msgs REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(std_srvs REQUIRED)
 find_package(visualization_msgs REQUIRED)
+find_package(geometry_msgs REQUIRED)
+find_package(trajectory_msgs REQUIRED)
+find_package(octomap_msgs REQUIRED)
+find_package(octomap REQUIRED)
 
 add_executable(rrt2D src/rrt2D.cpp)
 ament_target_dependencies(rrt2D rclcpp)
@@ -27,6 +31,10 @@ ament_target_dependencies(rrt3D std_msgs)
 ament_target_dependencies(rrt3D nav_msgs)
 ament_target_dependencies(rrt3D std_srvs)
 ament_target_dependencies(rrt3D visualization_msgs)
+ament_target_dependencies(rrt3D geometry_msgs)
+ament_target_dependencies(rrt3D trajectory_msgs)
+ament_target_dependencies(rrt3D octomap_msgs)
+target_link_libraries(rrt3D ${OCTOMAP_LIBRARIES})
 
 target_include_directories(rrt2D PUBLIC
   ${CMAKE_SOURCE_DIR}/include/multidim_rrt_cpp
@@ -40,7 +48,8 @@ install(TARGETS rrt2D
 target_include_directories(rrt3D PUBLIC
   ${CMAKE_SOURCE_DIR}/include/multidim_rrt_cpp
   $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:include>)
+  $<INSTALL_INTERFACE:include>
+  ${OCTOMAP_INCLUDE_DIRS})
 target_compile_features(rrt3D PUBLIC c_std_99 cxx_std_17)  # Require C99 and C++17
 
 install(TARGETS rrt3D
