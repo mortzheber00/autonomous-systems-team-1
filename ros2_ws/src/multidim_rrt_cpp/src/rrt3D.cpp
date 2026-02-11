@@ -14,6 +14,7 @@
 #include <octomap/octomap.h>
 #include <octomap_msgs/conversions.h>
 #include "TreeNode.h"
+#include <std_msgs/msg/string.hpp>
 #include <memory>
 #include <thread>
 #include <mutex>
@@ -84,6 +85,15 @@ public:
       std::bind(&RRT3DNode::octomap_callback, this, std::placeholders::_1)
     );
     
+    // Subscribe to global goal from global planner (high priority)
+    global_goal_subscriber_ = create_subscription<geometry_msgs::msg::PoseArray>(
+      "/global_goal", 10,
+      std::bind(&RRT3DNode::global_goal_callback, this, std::placeholders::_1)
+    );
+    
+    // Publisher for RRT status ("idle" / "active")
+    rrt_status_publisher_ = create_publisher<std_msgs::msg::String>("/rrt_status", 10);
+    
     // Timer for continuous trajectory publishing
     trajectory_timer_ = create_wall_timer(
       std::chrono::milliseconds(100),  // 10 Hz
@@ -134,9 +144,12 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr path_marker_publisher;
   rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr waypoint_path_publisher_;
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr frontier_subscriber;
+  rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr global_goal_subscriber_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscriber;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr rrt_status_publisher_;
   rclcpp::TimerBase::SharedPtr trajectory_timer_;
+  bool has_global_goal_ = false;  // True when pursuing a global planner goal (higher priority)
 
   /**
    * Callback for Octomap updates
@@ -157,16 +170,65 @@ private:
   }
 
   /**
+   * Callback for global goal from global planner (high priority)
+   *
+   * When the global planner commands backtracking to a junction or return-home,
+   * this overrides any local frontier goals. The RRT plans directly to the
+   * global goal position.
+   */
+  void global_goal_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
+  {
+    if (msg->poses.empty()) return;
+
+    RCLCPP_INFO(get_logger(), "[GLOBAL GOAL] Received global goal from global planner");
+
+    // Build candidate list from global goal (typically just 1 pose)
+    std::vector<std::vector<float>> candidates;
+    for (const auto& pose : msg->poses) {
+      candidates.push_back({
+        static_cast<float>(pose.position.x),
+        static_cast<float>(pose.position.y),
+        static_cast<float>(pose.position.z)
+      });
+    }
+
+    {
+      std::lock_guard<std::mutex> lock(planning_mutex_);
+      frontier_candidates_ = candidates;
+      has_global_goal_ = true;
+      // Cancel any active local-frontier path
+      goal_active_ = false;
+    }
+
+    // Start planning thread
+    bool expected = false;
+    if (is_planning_.compare_exchange_strong(expected, true)) {
+      std::thread(&RRT3DNode::plan_to_best_frontier_thread, this).detach();
+    }
+  }
+
+  /**
    * Callback for frontier goals subscriber
    * 
    * Called whenever local planner publishes top 5 frontier goals.
    * Tries each frontier in order until a valid path is found.
+   * Skipped when a global goal is being pursued.
    */
   void frontier_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
   {
     if (msg->poses.empty()) {
       RCLCPP_WARN(get_logger(), "Received empty frontier list");
       return;
+    }
+
+    // Skip local frontiers when pursuing a global goal
+    {
+      std::lock_guard<std::mutex> lock(planning_mutex_);
+      if (has_global_goal_ && goal_active_) {
+        RCLCPP_DEBUG(get_logger(), "Ignoring local frontiers — pursuing global goal");
+        return;
+      }
+      has_global_goal_ = false;  // Local planner is active again
     }
     
     RCLCPP_INFO(get_logger(), "Received %zu frontier candidates", msg->poses.size());
@@ -382,6 +444,11 @@ private:
   void trajectory_publishing_loop()
   {
     std::lock_guard<std::mutex> lock(planning_mutex_);
+    
+    // Publish RRT status
+    std_msgs::msg::String status_msg;
+    status_msg.data = (goal_active_ || is_planning_.load()) ? "active" : "idle";
+    rrt_status_publisher_->publish(status_msg);
     
     if (!goal_active_ || current_path_.empty()) return;
     

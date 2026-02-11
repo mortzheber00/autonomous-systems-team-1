@@ -96,6 +96,7 @@ private:
   const float search_radius_ = 60.0;         // Search radius for frontiers
   const float x_limit_position_ = -370.0;    // Cave boundary limit
   const size_t movement_history_size_ = 10;  // Number of movement samples for moving average
+  const float min_publish_gain_ = 1.3f;      // Minimum gain to publish a frontier (filters dead-end noise)
   
   // ---------------------------------------------------------------------------
   // Callbacks
@@ -226,13 +227,24 @@ private:
       scored_frontiers.push_back({point, total_gain});
     }
 
-    // 5. Sort by gain (highest first)
+    // 5. Filter out low-gain frontiers (dead-end / already-explored noise)
+    scored_frontiers.erase(
+      std::remove_if(scored_frontiers.begin(), scored_frontiers.end(),
+        [this](const ScoredFrontier& f) { return f.gain < min_publish_gain_; }),
+      scored_frontiers.end());
+
+    if (scored_frontiers.empty()) {
+      RCLCPP_INFO(get_logger(), "All frontiers below min gain threshold (%.2f) - area likely explored", min_publish_gain_);
+      return {};
+    }
+
+    // 6. Sort by gain (highest first)
     std::sort(scored_frontiers.begin(), scored_frontiers.end(),
               [](const ScoredFrontier& a, const ScoredFrontier& b) {
                 return a.gain > b.gain;
               });
 
-    // 6. Return top N frontiers
+    // 7. Return top N frontiers
     std::vector<geometry_msgs::msg::Point> result;
     size_t count = std::min(num_frontiers, scored_frontiers.size());
     
@@ -243,7 +255,7 @@ private:
       p.z = scored_frontiers[i].point.z();
       result.push_back(p);
       
-      RCLCPP_DEBUG(get_logger(), "Frontier %zu: [%.1f, %.1f, %.1f] gain: %.2f",
+      RCLCPP_INFO(get_logger(), "Frontier %zu: [%.1f, %.1f, %.1f] gain: %.2f",
                    i, p.x, p.y, p.z, scored_frontiers[i].gain);
     }
 
