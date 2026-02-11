@@ -47,7 +47,7 @@ class RRT3DNode : public rclcpp::Node
 public:
   RRT3DNode()
       : Node("RRT3DNode"), step_size(2.0), goal_tolerance(2.0), 
-        node_limit(5000), safety_radius_(4.0), occupied_threshold_(0.5)
+        node_limit(5000), safety_radius_(4.0), occupied_threshold_(0.5), rrt_timeout_(5.0)
   {
     // Create publisher for trajectory commands
     trajectory_publisher_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>("/command/trajectory", 10);
@@ -111,6 +111,7 @@ private:
   const size_t node_limit;            // Maximum number of nodes before stopping
   const float safety_radius_;         // Safety radius for obstacle clearance
   const float occupied_threshold_;    // Occupancy probability threshold
+  const float rrt_timeout_;     // Maximum time (seconds) to run RRT before giving up
   
   // Current state (updated by subscribers)
   std::vector<float> start_position = {0.0f, 0.0f, 0.0f};  // Current drone position
@@ -597,7 +598,7 @@ private:
     local_nodes.push_back(root);
     
     // RRT main loop: expand tree until goal found or node limit/time reached
-    while (local_nodes.size() < node_limit && (this->now() - start_time).nanoseconds() / 1e9 < 2.0)
+    while (local_nodes.size() < node_limit && (this->now() - start_time).nanoseconds() / 1e9 < rrt_timeout_)
     {
       // Step 1: Generate random point in configuration space
       // Use goal-biased sampling (50% toward goal for straighter paths in free space)

@@ -134,15 +134,16 @@ public:
     declare_parameter("home_y",    0.0);
     declare_parameter("home_z",   16.0);
     declare_parameter("junction_detect_angle_deg", 60.0);
-    declare_parameter("junction_proximity_m",      10.0);
+    declare_parameter("junction_proximity_m",      30.0);
     declare_parameter("no_frontier_timeout_sec",   12.0);
     declare_parameter("min_gain_threshold",         0.15);
     declare_parameter("goal_reached_tolerance_m",   8.0);
     declare_parameter("exploration_eval_radius_m", 10.0);
     declare_parameter("stagnation_timeout_sec",    20.0);
     declare_parameter("junction_confirm_count",       1);
-    declare_parameter("min_frontier_gain_for_timer",  0.3);
-
+    declare_parameter("min_frontier_gain_for_timer",  0.3);    
+    declare_parameter("candidate_merge_radius_m",    30.0);
+    declare_parameter("breadcrumb_spacing_m",        30.0);
     home_position_.x = get_parameter("home_x").as_double();
     home_position_.y = get_parameter("home_y").as_double();
     home_position_.z = get_parameter("home_z").as_double();
@@ -155,6 +156,8 @@ public:
     stagnation_timeout_          = get_parameter("stagnation_timeout_sec").as_double();
     junction_confirm_threshold_  = get_parameter("junction_confirm_count").as_int();
     min_frontier_gain_for_timer_ = get_parameter("min_frontier_gain_for_timer").as_double();
+    candidate_merge_radius_      = get_parameter("candidate_merge_radius_m").as_double();
+    breadcrumb_spacing_          = get_parameter("breadcrumb_spacing_m").as_double();
 
     // ---- Publishers ----
     global_goal_pub_    = create_publisher<geometry_msgs::msg::PoseArray>("/global_goal", 10);
@@ -218,6 +221,14 @@ private:
   geometry_msgs::msg::Point backtrack_target_;
   int backtrack_junction_id_ = -1;
 
+  // Breadcrumb trail: record drone positions for backtrack routing
+  std::vector<geometry_msgs::msg::Point> breadcrumbs_;
+  double breadcrumb_spacing_ = 30.0;  ///< Min distance between breadcrumbs
+
+  // Multi-hop backtrack waypoint queue (short hops the RRT can actually reach)
+  std::vector<geometry_msgs::msg::Point> backtrack_waypoints_;
+  size_t backtrack_wp_idx_ = 0;
+
   // Exploration progress tracking
   double last_explored_volume_ = 0.0;     ///< Number of known (free+occupied) leaves last check
   rclcpp::Time last_progress_time_;        ///< Last time we saw meaningful exploration progress
@@ -249,6 +260,7 @@ private:
   double goal_reached_tolerance_;
   double exploration_eval_radius_;
   double min_frontier_gain_for_timer_;  ///< Only frontiers with gain above this reset the timer
+  double candidate_merge_radius_;       ///< Radius for merging junction candidate detections
 
   // ---- ROS handles ----
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr global_goal_pub_;
@@ -270,6 +282,14 @@ private:
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     current_position_ = msg->pose.pose.position;
     odom_received_ = true;
+
+    // Record breadcrumbs for backtrack routing
+    if (state_ == ExplorationState::EXPLORING) {
+      if (breadcrumbs_.empty() ||
+          point_distance(current_position_, breadcrumbs_.back()) >= breadcrumb_spacing_) {
+        breadcrumbs_.push_back(current_position_);
+      }
+    }
   }
 
   void octomap_callback(const octomap_msgs::msg::Octomap::SharedPtr msg) {
@@ -417,78 +437,132 @@ private:
       }
 
       if (best_jct && best_arm && best_gain > min_gain_threshold_) {
-        // Backtrack to this junction
+        // Build multi-hop waypoint route from breadcrumbs to the junction
         backtrack_target_ = best_arm->target;
         backtrack_junction_id_ = best_jct->id;
+        backtrack_waypoints_ = build_backtrack_route(best_jct->position);
+        // Add the actual arm target as the final waypoint
+        backtrack_waypoints_.push_back(backtrack_target_);
+        backtrack_wp_idx_ = 0;
         state_ = ExplorationState::BACKTRACKING;
 
         RCLCPP_INFO(get_logger(),
-          "[GLOBAL] -> BACKTRACKING to junction %d arm (%.1f, %.1f, %.1f) gain=%.2f",
-          best_jct->id,
+          "[GLOBAL] -> BACKTRACKING to junction %d via %zu waypoints, final target (%.1f, %.1f, %.1f) gain=%.2f",
+          best_jct->id, backtrack_waypoints_.size(),
           backtrack_target_.x, backtrack_target_.y, backtrack_target_.z,
           best_gain);
 
-        publish_global_goal(backtrack_target_);
+        if (!backtrack_waypoints_.empty()) {
+          publish_global_goal(backtrack_waypoints_[0]);
+        }
       } else {
-        // No junctions left -> go home
+        // No junctions left -> go home via breadcrumb route
+        backtrack_waypoints_ = build_backtrack_route(home_position_);
+        backtrack_waypoints_.push_back(home_position_);
+        backtrack_wp_idx_ = 0;
         state_ = ExplorationState::RETURNING_HOME;
         RCLCPP_WARN(get_logger(),
-          "[GLOBAL] -> RETURNING_HOME - cave sufficiently explored.");
-        publish_global_goal(home_position_);
+          "[GLOBAL] -> RETURNING_HOME via %zu waypoints", backtrack_waypoints_.size());
+        if (!backtrack_waypoints_.empty()) {
+          publish_global_goal(backtrack_waypoints_[0]);
+        }
       }
     }
   }
 
   /**
-   * BACKTRACKING: RRT is flying us to a junction.
-   * Transition back to EXPLORING once we arrive near the target.
+   * BACKTRACKING: Follow multi-hop waypoints back to a junction.
+   * Each hop is short enough for the RRT to handle.
    */
   void handle_backtracking() {
-    double dist = point_distance(current_position_, backtrack_target_);
+    if (backtrack_waypoints_.empty() || backtrack_wp_idx_ >= backtrack_waypoints_.size()) {
+      // Shouldn't happen, but recover gracefully
+      RCLCPP_WARN(get_logger(), "[GLOBAL] Backtrack waypoints exhausted -> EXPLORING");
+      state_ = ExplorationState::EXPLORING;
+      last_frontier_time_ = now();
+      return;
+    }
+
+    auto& current_wp = backtrack_waypoints_[backtrack_wp_idx_];
+    double dist = point_distance(current_position_, current_wp);
 
     if (dist < goal_reached_tolerance_) {
       RCLCPP_INFO(get_logger(),
-        "[GLOBAL] Reached junction %d (dist=%.1fm) -> EXPLORING",
-        backtrack_junction_id_, dist);
+        "[GLOBAL] Reached backtrack waypoint %zu/%zu (dist=%.1fm)",
+        backtrack_wp_idx_ + 1, backtrack_waypoints_.size(), dist);
 
-      // Mark this arm as explored now that we have arrived
-      for (auto& jct : junctions_) {
-        if (jct.id == backtrack_junction_id_) {
-          for (auto& arm : jct.arms) {
-            double arm_dist = std::sqrt(
-              std::pow(arm.target.x - backtrack_target_.x, 2) +
-              std::pow(arm.target.y - backtrack_target_.y, 2) +
-              std::pow(arm.target.z - backtrack_target_.z, 2));
-            if (arm_dist < 5.0) {
-              arm.explored = true;
+      backtrack_wp_idx_++;
+
+      if (backtrack_wp_idx_ >= backtrack_waypoints_.size()) {
+        // Arrived at final target — mark arm explored and resume
+        RCLCPP_INFO(get_logger(),
+          "[GLOBAL] Reached junction %d -> EXPLORING", backtrack_junction_id_);
+
+        for (auto& jct : junctions_) {
+          if (jct.id == backtrack_junction_id_) {
+            for (auto& arm : jct.arms) {
+              double arm_dist = std::sqrt(
+                std::pow(arm.target.x - backtrack_target_.x, 2) +
+                std::pow(arm.target.y - backtrack_target_.y, 2) +
+                std::pow(arm.target.z - backtrack_target_.z, 2));
+              if (arm_dist < 5.0) {
+                arm.explored = true;
+              }
             }
+            jct.fully_explored = (jct.unexplored_arm_count() == 0);
           }
-          jct.fully_explored = (jct.unexplored_arm_count() == 0);
         }
-      }
 
-      state_ = ExplorationState::EXPLORING;
-      last_frontier_time_ = now();  // Reset timeout
+        state_ = ExplorationState::EXPLORING;
+        last_frontier_time_ = now();
+        // Reset stagnation timer so we get a fresh window
+        progress_time_initialized_ = false;
+      } else {
+        // Publish next waypoint
+        publish_global_goal(backtrack_waypoints_[backtrack_wp_idx_]);
+      }
     } else {
-      // Re-publish goal periodically so RRT keeps pursuing it
-      publish_global_goal(backtrack_target_);
+      // Re-publish current waypoint so RRT keeps pursuing it
+      publish_global_goal(current_wp);
     }
   }
 
   /**
-   * RETURNING_HOME: RRT is flying us to home base.
-   * Transition to DONE once we arrive.
+   * RETURNING_HOME: Follow multi-hop waypoints back to home base.
    */
   void handle_returning_home() {
-    double dist = point_distance(current_position_, home_position_);
+    if (backtrack_waypoints_.empty() || backtrack_wp_idx_ >= backtrack_waypoints_.size()) {
+      // Direct distance check as fallback
+      double dist = point_distance(current_position_, home_position_);
+      if (dist < goal_reached_tolerance_) {
+        RCLCPP_WARN(get_logger(),
+          "[GLOBAL] Arrived home (dist=%.1fm). Exploration complete!", dist);
+        state_ = ExplorationState::DONE;
+      } else {
+        publish_global_goal(home_position_);
+      }
+      return;
+    }
+
+    auto& current_wp = backtrack_waypoints_[backtrack_wp_idx_];
+    double dist = point_distance(current_position_, current_wp);
 
     if (dist < goal_reached_tolerance_) {
-      RCLCPP_WARN(get_logger(),
-        "[GLOBAL] Arrived home (dist=%.1fm). Exploration complete!", dist);
-      state_ = ExplorationState::DONE;
+      RCLCPP_INFO(get_logger(),
+        "[GLOBAL] Reached home waypoint %zu/%zu (dist=%.1fm)",
+        backtrack_wp_idx_ + 1, backtrack_waypoints_.size(), dist);
+
+      backtrack_wp_idx_++;
+
+      if (backtrack_wp_idx_ >= backtrack_waypoints_.size()) {
+        RCLCPP_WARN(get_logger(),
+          "[GLOBAL] Arrived home. Exploration complete!");
+        state_ = ExplorationState::DONE;
+      } else {
+        publish_global_goal(backtrack_waypoints_[backtrack_wp_idx_]);
+      }
     } else {
-      // Re-publish goal periodically
-      publish_global_goal(home_position_);
+      publish_global_goal(current_wp);
     }
   }
 
@@ -602,11 +676,15 @@ private:
       junction_candidates_.end());
 
     // Look for existing candidate near current position
+    // Use candidate_merge_radius_ (larger) so detections while the drone
+    // is moving through a junction area still confirm the same candidate.
     JunctionCandidate* match = nullptr;
+    double best_match_dist = candidate_merge_radius_;
     for (auto& cand : junction_candidates_) {
-      if (point_distance(cand.position, current_position_) < junction_proximity_) {
+      double d = point_distance(cand.position, current_position_);
+      if (d < best_match_dist) {
+        best_match_dist = d;
         match = &cand;
-        break;
       }
     }
 
@@ -693,6 +771,81 @@ private:
   // ==========================================================================
   // Junction Maintenance
   // ==========================================================================
+
+  /**
+   * Build a route of intermediate waypoints from the current position to a target
+   * by walking backwards through the breadcrumb trail.
+   *
+   * This ensures each hop is short enough for the RRT to plan in its
+   * node_limit / time budget.
+   */
+  std::vector<geometry_msgs::msg::Point> build_backtrack_route(
+      const geometry_msgs::msg::Point& target) {
+
+    std::vector<geometry_msgs::msg::Point> route;
+    if (breadcrumbs_.empty()) {
+      // No breadcrumbs — direct route (may fail if too far)
+      route.push_back(target);
+      return route;
+    }
+
+    // Find the breadcrumb closest to the target
+    size_t closest_idx = 0;
+    double closest_dist = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < breadcrumbs_.size(); ++i) {
+      double d = point_distance(breadcrumbs_[i], target);
+      if (d < closest_dist) {
+        closest_dist = d;
+        closest_idx = i;
+      }
+    }
+
+    // Find the breadcrumb closest to the drone's current position
+    size_t start_idx = 0;
+    double start_dist = std::numeric_limits<double>::max();
+    for (size_t i = 0; i < breadcrumbs_.size(); ++i) {
+      double d = point_distance(breadcrumbs_[i], current_position_);
+      if (d < start_dist) {
+        start_dist = d;
+        start_idx = i;
+      }
+    }
+
+    // Walk from start_idx toward closest_idx along the breadcrumb chain
+    if (start_idx <= closest_idx) {
+      // Target is "ahead" in the trail — walk forward
+      for (size_t i = start_idx; i <= closest_idx; ++i) {
+        route.push_back(breadcrumbs_[i]);
+      }
+    } else {
+      // Target is "behind" — walk backward (the common backtracking case)
+      for (size_t i = start_idx; i != static_cast<size_t>(-1) && i >= closest_idx; --i) {
+        route.push_back(breadcrumbs_[i]);
+        if (i == 0) break;  // Prevent underflow
+      }
+    }
+
+    // Downsample: keep only every ~breadcrumb_spacing_ worth of distance
+    // The breadcrumbs are already spaced by breadcrumb_spacing_, but if
+    // there are many close together we can skip some.
+    if (route.size() > 2) {
+      std::vector<geometry_msgs::msg::Point> sparse;
+      sparse.push_back(route.front());
+      for (size_t i = 1; i < route.size() - 1; ++i) {
+        if (point_distance(route[i], sparse.back()) >= breadcrumb_spacing_ * 0.8) {
+          sparse.push_back(route[i]);
+        }
+      }
+      sparse.push_back(route.back());
+      route = sparse;
+    }
+
+    RCLCPP_INFO(get_logger(),
+      "[BACKTRACK ROUTE] Built %zu-waypoint route from breadcrumbs (%zu total crumbs)",
+      route.size(), breadcrumbs_.size());
+
+    return route;
+  }
 
   /**
    * Check if the OctoMap is still growing (exploration is making progress).
