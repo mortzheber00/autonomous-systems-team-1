@@ -21,6 +21,7 @@
 #include <tf2/LinearMath/Vector3.h>
 #include <nav_msgs/msg/odometry.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
+#include <std_msgs/msg/bool.hpp>
 
 #include <vector>
 #include <cmath>
@@ -59,6 +60,13 @@ public:
       std::bind(&LocalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
 
+    enable_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/state_machine/enable_local_planner", 1,
+      std::bind(&LocalPlannerNode::enable_callback, this, std::placeholders::_1)
+    );
+    
+    last_frontier_found_time_ = this->now();
+
     // Timer: Run planning loop at 2 Hz (500ms)
     planning_timer_ = create_wall_timer(
         std::chrono::milliseconds(500),
@@ -81,6 +89,7 @@ private:
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_subscription_;
   rclcpp::TimerBase::SharedPtr planning_timer_;
 
   // Data Storage
@@ -89,6 +98,9 @@ private:
   
   // Moving average of drone movement direction
   std::vector<tf2::Vector3> movement_history_; 
+
+  // State Machine for Goal Persistence
+  bool local_planner_enabled_ = true;
 
   // Configuration
   const float exploration_radius_ = 10.0;    // Radius around frontier to calculate gain
@@ -125,6 +137,11 @@ private:
     last_drone_position_ = new_pos;
   }
 
+  void enable_callback(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    local_planner_enabled_ = msg->data;
+  }
+
   void octomap_callback(const octomap_msgs::msg::Octomap::SharedPtr msg)
   {
     // Convert and store the tree
@@ -149,6 +166,10 @@ private:
     if (!current_octree_) {
         RCLCPP_DEBUG(get_logger(), "Waiting for Octomap...");
         return;
+    }
+
+    if (!local_planner_enabled_) {
+      return;
     }
 
     // Find top 5 frontiers

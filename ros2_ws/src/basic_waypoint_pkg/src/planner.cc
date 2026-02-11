@@ -131,14 +131,14 @@ bool BasicPlanner::planTrajectory(
   //
   // ~~~~ begin solution
   //
-  // Add each waypoint from the stored waypoints_ member variable
-  for (const auto& waypoint : waypoints_) {
-      mav_trajectory_generation::Vertex intermediate(dimension);
-      intermediate.addConstraint(
+      // Add each waypoint from the stored waypoints_ member variable
+      for (const auto& waypoint : waypoints_) {
+        mav_trajectory_generation::Vertex intermediate(dimension);
+        intermediate.addConstraint(
           mav_trajectory_generation::derivative_order::POSITION,
           waypoint);
-      vertices.push_back(intermediate);
-  }
+        vertices.push_back(intermediate);
+      }
 
   //auto tunnel_entry_point = Eigen::Vector3d(25.0, 39.0, 11.0);
   //mav_trajectory_generation::Vertex tunnel_entry(dimension);
@@ -247,8 +247,10 @@ bool BasicPlanner::planTrajectory(
       yaw_vertices.push_back(mid_yaw);
   }
 
-  // End Yaw: face negative x (PI) at start point
-  double desired_yaw = M_PI;
+  // End Yaw: face the direction of travel toward the goal
+  double desired_yaw = std::atan2(
+    goal_pos.y() - current_pose_.translation().y(),
+    goal_pos.x() - current_pose_.translation().x());
   mav_trajectory_generation::Vertex end_yaw(yaw_dimension);
   end_yaw.makeStartOrEnd(Eigen::VectorXd::Constant(yaw_dimension, desired_yaw), yaw_derivative_to_optimize);
   yaw_vertices.push_back(end_yaw);
