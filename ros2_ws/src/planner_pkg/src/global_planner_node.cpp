@@ -18,6 +18,7 @@
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <octomap/octomap.h>
+#include <cmath>
 #include <octomap_msgs/conversions.h>
 #include <cmath>
 #include <cstdio>
@@ -507,22 +508,33 @@ private:
     
     int unknown_count = 0;
     int total_count = 0;
+    float voxel_size = octree_->getResolution();
     
-    // Iterate through Octomap to count unknown voxels in radius
-    for (auto it = octree_->begin(octree_->getTreeDepth()); 
-         it != octree_->end(); ++it) {
-      geometry_msgs::msg::Point voxel_pos;
-      voxel_pos.x = it.getX();
-      voxel_pos.y = it.getY();
-      voxel_pos.z = it.getZ();
-      
-      float dist = distance(position, voxel_pos);
-      if (dist <= exploration_radius_) {
-        total_count++;
-        
-        // Check if voxel is unknown (not occupied, not free in observed space)
-        if (it->getLogOdds() == 0) {  // Unknown voxels have log odds of 0
-          unknown_count++;
+    // Sample points in exploration radius to check for unknown space
+    // Use a grid-based sampling approach to properly check unexplored areas
+    for (float x = position.x - exploration_radius_; x <= position.x + exploration_radius_; x += voxel_size) {
+      for (float y = position.y - exploration_radius_; y <= position.y + exploration_radius_; y += voxel_size) {
+        for (float z = position.z - exploration_radius_; z <= position.z + exploration_radius_; z += voxel_size) {
+          
+          // Check if point is within exploration radius
+          float dist = sqrt(pow(x - position.x, 2) + pow(y - position.y, 2) + pow(z - position.z, 2));
+          if (dist > exploration_radius_) continue;
+          
+          total_count++;
+          
+          // Check if this location is unknown/unexplored
+          octomap::point3d query_point(x, y, z);
+          octomap::OcTreeNode* node = octree_->search(query_point);
+          
+          if (!node) {
+            // Node doesn't exist = unexplored/unknown space
+            unknown_count++;
+          } else {
+            // Node exists but check if it's unknown (log odds ~ 0)
+            if (abs(node->getLogOdds()) < 0.1) {  // Near-zero log odds = unknown
+              unknown_count++;
+            }
+          }
         }
       }
     }
