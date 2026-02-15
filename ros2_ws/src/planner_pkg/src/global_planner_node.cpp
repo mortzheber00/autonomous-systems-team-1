@@ -136,7 +136,7 @@ public:
     declare_parameter("home_y",    0.0);
     declare_parameter("home_z",   16.0);
     declare_parameter("junction_detect_angle_deg", 60.0);
-    declare_parameter("junction_proximity_m",      30.0);
+    declare_parameter("junction_proximity_m",      60.0);
     declare_parameter("no_frontier_timeout_sec",   12.0);
     declare_parameter("min_gain_threshold",         0.15);
     declare_parameter("goal_reached_tolerance_m",   8.0);
@@ -146,6 +146,7 @@ public:
     declare_parameter("min_frontier_gain_for_timer",  0.3);    
     declare_parameter("candidate_merge_radius_m",    30.0);
     declare_parameter("breadcrumb_spacing_m",        30.0);
+    declare_parameter("wall_clearance_m",             3.0);
     home_position_.x = get_parameter("home_x").as_double();
     home_position_.y = get_parameter("home_y").as_double();
     home_position_.z = get_parameter("home_z").as_double();
@@ -160,6 +161,7 @@ public:
     min_frontier_gain_for_timer_ = get_parameter("min_frontier_gain_for_timer").as_double();
     candidate_merge_radius_      = get_parameter("candidate_merge_radius_m").as_double();
     breadcrumb_spacing_          = get_parameter("breadcrumb_spacing_m").as_double();
+    wall_clearance_              = get_parameter("wall_clearance_m").as_double();
 
     // ---- Publishers ----
     global_goal_pub_    = create_publisher<geometry_msgs::msg::PoseArray>("/global_goal", 10);
@@ -263,6 +265,7 @@ private:
   double exploration_eval_radius_;
   double min_frontier_gain_for_timer_;  ///< Only frontiers with gain above this reset the timer
   double candidate_merge_radius_;       ///< Radius for merging junction candidate detections
+  double wall_clearance_;                ///< Min distance a backtrack target must be from walls
 
   // ---- ROS handles ----
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr global_goal_pub_;
@@ -440,10 +443,13 @@ private:
 
       if (best_jct && best_arm && best_gain > min_gain_threshold_) {
         // Build multi-hop waypoint route from breadcrumbs to the junction
-        backtrack_target_ = best_arm->target;
+        // Ensure the arm target is not dangerously close to a wall.
+        // If it is, pull it toward the junction centre (a known-safe position).
+        backtrack_target_ = adjust_for_wall_clearance(
+            best_arm->target, best_jct->position, wall_clearance_);
         backtrack_junction_id_ = best_jct->id;
         backtrack_waypoints_ = build_backtrack_route(best_jct->position);
-        // Add the actual arm target as the final waypoint
+        // Add the (possibly adjusted) arm target as the final waypoint
         backtrack_waypoints_.push_back(backtrack_target_);
         backtrack_wp_idx_ = 0;
         state_ = ExplorationState::BACKTRACKING;
@@ -731,7 +737,12 @@ private:
         "[JUNCTION CANDIDATE] New candidate at (%.1f, %.1f, %.1f) with %zu arms — needs %d confirmations",
         current_position_.x, current_position_.y, current_position_.z,
         clusters.size(), junction_confirm_threshold_);
-      return;
+
+      if (cand.detection_count < junction_confirm_threshold_) {
+        return;  // Not yet confirmed
+      }
+      // Threshold is 0 or 1 — confirm immediately
+      match = &junction_candidates_.back();
     }
 
     // 6. Confirmed — create the junction from the candidate
@@ -1175,6 +1186,76 @@ private:
     }
 
     marker_pub_->publish(marker_array);
+  }
+
+  // ==========================================================================
+  // Wall Clearance
+  // ==========================================================================
+
+  /**
+   * Check whether a point has at least `clearance` metres of free space
+   * around it (no occupied OctoMap voxels within that radius).
+   */
+  bool has_wall_clearance(const geometry_msgs::msg::Point& pos, double clearance) {
+    if (!octree_) return true;  // No map yet — assume OK
+
+    float res = static_cast<float>(octree_->getResolution());
+    float step = std::max(res, 0.5f);  // Fine-ish sampling
+    octomap::point3d center(pos.x, pos.y, pos.z);
+
+    for (double dx = -clearance; dx <= clearance; dx += step) {
+      for (double dy = -clearance; dy <= clearance; dy += step) {
+        for (double dz = -clearance; dz <= clearance; dz += step) {
+          if (dx*dx + dy*dy + dz*dz > clearance * clearance) continue;
+          octomap::point3d p = center + octomap::point3d(dx, dy, dz);
+          auto* node = octree_->search(p);
+          if (node && octree_->isNodeOccupied(*node)) {
+            return false;
+          }
+        }
+      }
+    }
+    return true;
+  }
+
+  /**
+   * If `target` is too close to a wall, pull it toward `safe_anchor`
+   * (typically the junction centre, which the drone already passed through)
+   * until it has enough clearance, or give up and return the anchor.
+   */
+  geometry_msgs::msg::Point adjust_for_wall_clearance(
+      const geometry_msgs::msg::Point& target,
+      const geometry_msgs::msg::Point& safe_anchor,
+      double clearance) {
+
+    if (has_wall_clearance(target, clearance)) {
+      return target;  // Already fine
+    }
+
+    RCLCPP_WARN(get_logger(),
+      "[WALL CHECK] Backtrack target (%.1f, %.1f, %.1f) is within %.1fm of a wall — adjusting",
+      target.x, target.y, target.z, clearance);
+
+    // Linearly interpolate from target toward safe_anchor in 10% steps
+    for (double t = 0.1; t <= 1.0; t += 0.1) {
+      geometry_msgs::msg::Point candidate;
+      candidate.x = target.x + t * (safe_anchor.x - target.x);
+      candidate.y = target.y + t * (safe_anchor.y - target.y);
+      candidate.z = target.z + t * (safe_anchor.z - target.z);
+
+      if (has_wall_clearance(candidate, clearance)) {
+        RCLCPP_INFO(get_logger(),
+          "[WALL CHECK] Adjusted target to (%.1f, %.1f, %.1f) (%.0f%% toward junction)",
+          candidate.x, candidate.y, candidate.z, t * 100);
+        return candidate;
+      }
+    }
+
+    // Worst case: use the junction centre itself
+    RCLCPP_WARN(get_logger(),
+      "[WALL CHECK] Could not find clear point — falling back to junction centre (%.1f, %.1f, %.1f)",
+      safe_anchor.x, safe_anchor.y, safe_anchor.z);
+    return safe_anchor;
   }
 
   // ==========================================================================
