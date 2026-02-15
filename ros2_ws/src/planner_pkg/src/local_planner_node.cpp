@@ -61,7 +61,7 @@ public:
 
     // Timer: Run planning loop at 2 Hz (500ms)
     planning_timer_ = create_wall_timer(
-        std::chrono::milliseconds(2000),
+        std::chrono::milliseconds(500),
         std::bind(&LocalPlannerNode::planning_loop, this)
     );
     

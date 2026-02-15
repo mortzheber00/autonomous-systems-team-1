@@ -46,8 +46,8 @@ class RRT3DNode : public rclcpp::Node
 {
 public:
   RRT3DNode()
-      : Node("RRT3DNode"), step_size(2.0), goal_tolerance(2.0), 
-        node_limit(5000), safety_radius_(4.0), occupied_threshold_(0.5), rrt_timeout_(5.0)
+      : Node("RRT3DNode"), step_size(2.0), goal_tolerance(3.0), 
+        node_limit(10000), safety_radius_(2.0), occupied_threshold_(0.5), rrt_timeout_(5.0)
   {
     // Create publisher for trajectory commands
     trajectory_publisher_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>("/command/trajectory", 10);
@@ -612,7 +612,7 @@ private:
         // Random sampling in reasonable bounds
         rand_x = start_pos[0] + (rand() % 200 - 100);
         rand_y = start_pos[1] + (rand() % 200 - 100);
-        rand_z = start_pos[2] + (rand() % 20 - 10);
+        rand_z = start_pos[2] + (rand() % 40 - 20);
       }
       
       float min_distance = INFINITY;
