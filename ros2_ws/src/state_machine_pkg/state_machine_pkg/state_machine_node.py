@@ -4,17 +4,16 @@ import json
 import math
 import os
 from enum import Enum
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from rclpy.exceptions import ParameterUninitializedException
 
-from geometry_msgs.msg import Quaternion, Transform, Twist
-from nav_msgs.msg import Odometry
+from geometry_msgs.msg import PoseStamped, Quaternion
+from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool
-from trajectory_msgs.msg import MultiDOFJointTrajectory, MultiDOFJointTrajectoryPoint
 from visualization_msgs.msg import MarkerArray
 
 from ament_index_python.packages import get_package_share_directory
@@ -36,45 +35,47 @@ class StateMachineNode(Node):
         self.declare_parameter("auto_start", True)
         self.declare_parameter("takeoff_alt", 10.0)
         self.declare_parameter("entry_goal", [-55.0, 10.0, 12.0])
-        self.declare_parameter("land_goal", [])
+        self.declare_parameter("entry_waypoints", rclpy.Parameter.Type.DOUBLE_ARRAY)
+        self.declare_parameter("land_goal", rclpy.Parameter.Type.DOUBLE_ARRAY)
         self.declare_parameter("land_z", 1.0)
         self.declare_parameter("goal_tolerance", 2.0)
         self.declare_parameter("command_rate_hz", 2.0)
         self.declare_parameter("target_lantern_count", 3)
         self.declare_parameter("explore_timeout_sec", 600.0)
         self.declare_parameter("lantern_output_path", "")
-        self.declare_parameter("use_basic_waypoint_entry", False)
 
         self.auto_start = self.get_parameter("auto_start").get_parameter_value().bool_value
         self.takeoff_alt = self.get_parameter("takeoff_alt").get_parameter_value().double_value
         self.entry_goal = self._get_vec_param("entry_goal")
+        self.entry_waypoints = self._get_waypoints_param("entry_waypoints")
         self.land_goal = self._get_vec_param("land_goal", optional=True)
         self.land_z = self.get_parameter("land_z").get_parameter_value().double_value
         self.goal_tolerance = self.get_parameter("goal_tolerance").get_parameter_value().double_value
         self.command_rate_hz = self.get_parameter("command_rate_hz").get_parameter_value().double_value
         self.target_lantern_count = self.get_parameter("target_lantern_count").get_parameter_value().integer_value
         self.explore_timeout_sec = self.get_parameter("explore_timeout_sec").get_parameter_value().double_value
-        self.lantern_output_path = self._resolve_output_path(
-            self.get_parameter("lantern_output_path").get_parameter_value().string_value
-        )
-        self.use_basic_waypoint_entry = (
-            self.get_parameter("use_basic_waypoint_entry").get_parameter_value().bool_value
-        )
+        self.lantern_output_path = self._resolve_output_path(self.get_parameter("lantern_output_path").get_parameter_value().string_value)
 
-        self.state = MissionState.IDLE
-        self.have_odom = False
+        self.state = MissionState.IDLE  # start with IDLE
+        self.have_odom = False  # flag to indicate if we've received odometry yet
         self.current_pose = None
         self.current_orientation = None
         self.current_yaw = 0.0
 
+        # time tracker
         self.explore_start_time = None
         self.land_target = None
+        self.takeoff_target = None
+
+        # prevent re-sending goals every tick
+        self.goal_sent = False
 
         self.detected_lanterns: Dict[int, Dict[str, float]] = {}
 
-        self.trajectory_pub = self.create_publisher(
-            MultiDOFJointTrajectory,
-            "/command/trajectory",
+        # Publish goals to the basic waypoint planner
+        self.goal_path_pub = self.create_publisher(
+            Path,
+            "/goal_path",
             10,
         )
 
@@ -105,6 +106,9 @@ class StateMachineNode(Node):
 
         self.get_logger().info("State machine node initialized")
         self.get_logger().info(f"Output path for lanterns: {self.lantern_output_path}")
+        self.get_logger().info(
+            f"Entry waypoints: {len(self.entry_waypoints)} waypoint(s) -> goal {self.entry_goal}"
+        )
         self._publish_enable_local_planner(False)
 
     def _get_vec_param(self, name: str, optional: bool = False):
@@ -121,6 +125,21 @@ class StateMachineNode(Node):
             raise ValueError(f"Parameter '{name}' must be a list of 3 numbers")
         return [float(v) for v in value]
 
+    def _get_waypoints_param(self, name: str) -> List[List[float]]:
+        """Parse a flat list of doubles into a list of [x, y, z] triples."""
+        try:
+            flat = self.get_parameter(name).value
+        except ParameterUninitializedException:
+            flat = []
+        if not flat:
+            return []
+        if len(flat) % 3 != 0:
+            raise ValueError(f"Parameter '{name}' length must be a multiple of 3")
+        return [
+            [float(flat[i]), float(flat[i + 1]), float(flat[i + 2])]
+            for i in range(0, len(flat), 3)
+        ]
+
     def _resolve_output_path(self, path: str) -> str:
         if path:
             return os.path.expanduser(path)
@@ -133,7 +152,7 @@ class StateMachineNode(Node):
         self.current_yaw = self._yaw_from_quaternion(self.current_orientation)
         if not self.have_odom:
             self.have_odom = True
-            self.get_logger().info("Received first odometry")
+            self.get_logger().info("[state-machine] Received first odometry")
 
     def lantern_callback(self, msg: MarkerArray):
         for marker in msg.markers:
@@ -156,15 +175,22 @@ class StateMachineNode(Node):
             return
 
         if self.state == MissionState.TAKEOFF:
-            target = [self.current_pose.x, self.current_pose.y, self.takeoff_alt]
-            self._publish_trajectory(target)
-            if self._is_at_target(target):
+            if not self.goal_sent:
+                self.takeoff_target = [
+                    self.current_pose.x,
+                    self.current_pose.y,
+                    self.takeoff_alt,
+                ]
+                self._send_goal(self.takeoff_target)
+                self.goal_sent = True
+            if self._is_at_target(self.takeoff_target):
                 self._transition_to(MissionState.GO_TO_ENTRANCE)
             return
 
         if self.state == MissionState.GO_TO_ENTRANCE:
-            if not self.use_basic_waypoint_entry:
-                self._publish_trajectory(self.entry_goal)
+            if not self.goal_sent:
+                self._send_goal(self.entry_goal, waypoints=self.entry_waypoints)
+                self.goal_sent = True
             if self._is_at_target(self.entry_goal):
                 self._transition_to(MissionState.EXPLORE)
             return
@@ -178,7 +204,9 @@ class StateMachineNode(Node):
         if self.state == MissionState.LAND:
             if self.land_target is None:
                 self.land_target = self._compute_land_target()
-            self._publish_trajectory(self.land_target)
+            if not self.goal_sent:
+                self._send_goal(self.land_target)
+                self.goal_sent = True
             if self._is_at_target(self.land_target):
                 self._transition_to(MissionState.DONE)
             return
@@ -190,11 +218,14 @@ class StateMachineNode(Node):
         if new_state == self.state:
             return
 
-        self.get_logger().info(f"Transition: {self.state.value} -> {new_state.value}")
+        self.get_logger().info(f"[state-machine] Transition: {self.state.value} -> {new_state.value}")
         self.state = new_state
+        self.goal_sent = False
 
         if new_state == MissionState.EXPLORE:
             self.explore_start_time = self.get_clock().now()
+            # Stop the waypoint planner so it doesn't conflict with the local planner
+            self._cancel_planner()
             self._publish_enable_local_planner(True)
         elif new_state in (MissionState.TAKEOFF, MissionState.GO_TO_ENTRANCE, MissionState.LAND, MissionState.DONE):
             self._publish_enable_local_planner(False)
@@ -210,23 +241,44 @@ class StateMachineNode(Node):
         msg.data = enabled
         self.enable_local_planner_pub.publish(msg)
 
-    def _publish_trajectory(self, target):
-        traj = MultiDOFJointTrajectory()
-        traj.header.stamp = self.get_clock().now().to_msg()
-        traj.header.frame_id = "world"
+    def _send_goal(self, target, waypoints=None):
+        """Send a goal (with optional intermediate waypoints) to the planner.
 
-        point = MultiDOFJointTrajectoryPoint()
-        transform = Transform()
-        transform.translation.x = float(target[0])
-        transform.translation.y = float(target[1])
-        transform.translation.z = float(target[2])
-        transform.rotation = self._quaternion_from_yaw(self.current_yaw)
-        point.transforms = [transform]
-        point.velocities = [Twist()]
-        point.accelerations = [Twist()]
-        traj.points = [point]
+        The ``goal_path`` message is a ``nav_msgs/Path``.  The last pose is
+        the goal position; all preceding poses are intermediate waypoints.
+        """
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = "world"
 
-        self.trajectory_pub.publish(traj)
+        if waypoints:
+            for wp in waypoints:
+                ps = PoseStamped()
+                ps.header = path.header
+                ps.pose.position.x = float(wp[0])
+                ps.pose.position.y = float(wp[1])
+                ps.pose.position.z = float(wp[2])
+                path.poses.append(ps)
+
+        goal_pose = PoseStamped()
+        goal_pose.header = path.header
+        goal_pose.pose.position.x = float(target[0])
+        goal_pose.pose.position.y = float(target[1])
+        goal_pose.pose.position.z = float(target[2])
+        path.poses.append(goal_pose)
+
+        self.goal_path_pub.publish(path)
+        self.get_logger().info(
+            f"Sent goal ({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f}) "
+            f"with {len(path.poses) - 1} waypoint(s) to planner"
+        )
+
+    def _cancel_planner(self):
+        """Send an empty path to stop the planner from republishing."""
+        path = Path()
+        path.header.stamp = self.get_clock().now().to_msg()
+        path.header.frame_id = "world"
+        self.goal_path_pub.publish(path)
 
     def _compute_land_target(self):
         if self.land_goal is not None:
@@ -275,15 +327,6 @@ class StateMachineNode(Node):
         siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
         cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
         return math.atan2(siny_cosp, cosy_cosp)
-
-    @staticmethod
-    def _quaternion_from_yaw(yaw):
-        q = Quaternion()
-        q.x = 0.0
-        q.y = 0.0
-        q.z = math.sin(yaw / 2.0)
-        q.w = math.cos(yaw / 2.0)
-        return q
 
 
 def main(args=None):

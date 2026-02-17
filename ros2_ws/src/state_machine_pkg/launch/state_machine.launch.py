@@ -49,7 +49,6 @@ def generate_launch_description():
     return LaunchDescription([
         state_machine_node,
         local_planner_node,
-        # Disabled: planner and sampler conflict with state machine during TAKEOFF
-        # waypoint_planner_node,
-        # sampler_node,
+        waypoint_planner_node,
+        sampler_node,
     ])

@@ -83,6 +83,12 @@ void BasicPlanner::setMaxSpeed(const double max_v)
   max_v_ = max_v;
 }
 
+// Method to override intermediate waypoints.
+void BasicPlanner::setWaypoints(const std::vector<Eigen::Vector3d> & waypoints)
+{
+  waypoints_ = waypoints;
+}
+
 // Plans a trajectory from the current position to a goal position and velocity
 // we neglect attitude here for simplicity
 bool BasicPlanner::planTrajectory(
@@ -138,6 +144,17 @@ bool BasicPlanner::planTrajectory(
           mav_trajectory_generation::derivative_order::POSITION,
           waypoint);
         vertices.push_back(intermediate);
+      }
+
+      // If there are no intermediate waypoints the optimizer would have only
+      // two fully-constrained vertices and zero free variables, which causes
+      // a crash.  Insert the midpoint so it has something to optimise.
+      if (waypoints_.empty()) {
+        Eigen::Vector3d mid = 0.5 * (current_pose_.translation() + goal_pos.head<3>());
+        mav_trajectory_generation::Vertex midpoint(dimension);
+        midpoint.addConstraint(
+          mav_trajectory_generation::derivative_order::POSITION, mid);
+        vertices.push_back(midpoint);
       }
 
   //auto tunnel_entry_point = Eigen::Vector3d(25.0, 39.0, 11.0);
