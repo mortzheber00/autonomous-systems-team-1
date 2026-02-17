@@ -137,65 +137,25 @@ bool BasicPlanner::planTrajectory(
   //
   // ~~~~ begin solution
   //
-      // Add each waypoint from the stored waypoints_ member variable
-      for (const auto& waypoint : waypoints_) {
-        mav_trajectory_generation::Vertex intermediate(dimension);
-        intermediate.addConstraint(
+  // Add each waypoint from the stored waypoints_ member variable
+  for (const auto& waypoint : waypoints_) {
+      mav_trajectory_generation::Vertex intermediate(dimension);
+      intermediate.addConstraint(
           mav_trajectory_generation::derivative_order::POSITION,
           waypoint);
-        vertices.push_back(intermediate);
-      }
+      vertices.push_back(intermediate);
+  }
 
-      // If there are no intermediate waypoints the optimizer would have only
-      // two fully-constrained vertices and zero free variables, which causes
-      // a crash.  Insert the midpoint so it has something to optimise.
-      if (waypoints_.empty()) {
-        Eigen::Vector3d mid = 0.5 * (current_pose_.translation() + goal_pos.head<3>());
-        mav_trajectory_generation::Vertex midpoint(dimension);
-        midpoint.addConstraint(
-          mav_trajectory_generation::derivative_order::POSITION, mid);
-        vertices.push_back(midpoint);
-      }
-
-  //auto tunnel_entry_point = Eigen::Vector3d(25.0, 39.0, 11.0);
-  //mav_trajectory_generation::Vertex tunnel_entry(dimension);
-  //tunnel_entry.addConstraint(
-  //    mav_trajectory_generation::derivative_order::POSITION,
-  //    tunnel_entry_point);
-  //tunnel_entry.addConstraint(
-  //    mav_trajectory_generation::derivative_order::VELOCITY,
-  //    Eigen::Vector3d(-0.4, 0.0, 0.0));
-  //tunnel_entry.addConstraint(
-  //    mav_trajectory_generation::derivative_order::ACCELERATION,
-  //    Eigen::Vector3d(-0.1, 0.0, 0.0));
-  //vertices.push_back(tunnel_entry);
-//
-  //auto temp_stop_point = Eigen::Vector3d(13.5, 39.0, 11.0);
-  //mav_trajectory_generation::Vertex stop(dimension);
-  //stop.addConstraint(
-  //    mav_trajectory_generation::derivative_order::POSITION,
-  //    temp_stop_point);
-  //stop.addConstraint(
-  //    mav_trajectory_generation::derivative_order::VELOCITY,
-  //    Eigen::Vector3d::Zero());
-  //stop.addConstraint(
-  //    mav_trajectory_generation::derivative_order::ACCELERATION,
-  //    Eigen::Vector3d::Zero());
-  //vertices.push_back(stop);
-//
-  //auto transition_point2 = Eigen::Vector3d(2.0, 39.0, 11.0);
-  //mav_trajectory_generation::Vertex transition2(dimension);
-  //transition2.addConstraint(
-  //    mav_trajectory_generation::derivative_order::POSITION,
-  //    transition_point2);
-  //vertices.push_back(transition2);
-//
-  //auto transition_point = Eigen::Vector3d(-2.0, 8.0, 4.0);
-  //mav_trajectory_generation::Vertex transition(dimension);
-  //transition.addConstraint(
-  //    mav_trajectory_generation::derivative_order::POSITION,
-  //    transition_point);
-  //vertices.push_back(transition);
+  // If there are no intermediate waypoints the optimizer would have only
+  // two fully-constrained vertices and zero free variables, which causes
+  // a crash.  Insert the midpoint so it has something to optimise.
+  if (waypoints_.empty()) {
+    Eigen::Vector3d mid = 0.5 * (current_pose_.translation() + goal_pos.head<3>());
+    mav_trajectory_generation::Vertex midpoint(dimension);
+    midpoint.addConstraint(
+      mav_trajectory_generation::derivative_order::POSITION, mid);
+    vertices.push_back(midpoint);
+  }
 
   //
   // ~~~~ end solution
@@ -264,10 +224,8 @@ bool BasicPlanner::planTrajectory(
       yaw_vertices.push_back(mid_yaw);
   }
 
-  // End Yaw: face the direction of travel toward the goal
-  double desired_yaw = std::atan2(
-    goal_pos.y() - current_pose_.translation().y(),
-    goal_pos.x() - current_pose_.translation().x());
+  // End Yaw: face negative x (PI) at start point
+  double desired_yaw = M_PI;
   mav_trajectory_generation::Vertex end_yaw(yaw_dimension);
   end_yaw.makeStartOrEnd(Eigen::VectorXd::Constant(yaw_dimension, desired_yaw), yaw_derivative_to_optimize);
   yaw_vertices.push_back(end_yaw);
