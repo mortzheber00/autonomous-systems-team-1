@@ -60,6 +60,7 @@ public:
       std::bind(&LocalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
 
+    // Added this for: Enable/Disable Local Planner for state machine control
     enable_subscription_ = create_subscription<std_msgs::msg::Bool>(
       "/state_machine/enable_local_planner", 1,
       std::bind(&LocalPlannerNode::enable_callback, this, std::placeholders::_1)
@@ -168,6 +169,7 @@ private:
         return;
     }
 
+    // enable by state-machine
     if (!local_planner_enabled_) {
       return;
     }

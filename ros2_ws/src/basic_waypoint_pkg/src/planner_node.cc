@@ -1,6 +1,5 @@
 /*
  * Trajectory planner using mav_trajectory_generation in ROS2.
- *
  * Accepts dynamic goals on the "goal_path" topic (nav_msgs/Path).
  * The last pose in the path is the goal; preceding poses are
  * intermediate waypoints.  An empty path cancels republishing.
@@ -8,7 +7,6 @@
  * If the "goal" parameter is set (list of 3 doubles) the node will
  * also plan once at startup for backward-compatibility.
  */
-
 #include <memory>
 #include <iostream>
 #include <chrono>
@@ -23,13 +21,13 @@ int main(int argc, char ** argv)
 {
   rclcpp::init(argc, argv);
 
-  // Create node – name "planner" to match config-file namespace
+  // Create node
   auto node = rclcpp::Node::make_shared("planner");
 
   // Instantiate basic planner
   BasicPlanner planner(node);
 
-  // Wait for initialization (odometry)
+  // Wait for initialization
   rclcpp::Rate loop_rate(10.0);
   while (rclcpp::ok() && !planner.isInitialized()) {
     rclcpp::spin_some(node);
@@ -40,30 +38,7 @@ int main(int argc, char ** argv)
 
   // Shared state for the current trajectory
   auto trajectory = std::make_shared<mav_trajectory_generation::Trajectory>();
-  // Republish counter: publish a few times so late-joining subscribers can
-  // catch the trajectory, then stop so the sampler isn't constantly reset.
   auto republish_remaining = std::make_shared<int>(0);
-
-  // ------------------------------------------------------------------
-  // (Optional) Plan once from the "goal" parameter for backward compat
-  // ------------------------------------------------------------------
-  std::vector<double> goal_flat;
-  node->declare_parameter("goal", std::vector<double>());
-  node->get_parameter("goal", goal_flat);
-
-  if (goal_flat.size() == 3) {
-    Eigen::Vector3d goal_position(goal_flat[0], goal_flat[1], goal_flat[2]);
-    Eigen::Vector3d goal_velocity(0.0, 0.0, 0.0);
-    if (planner.planTrajectory(goal_position, goal_velocity, trajectory.get())) {
-      planner.publishTrajectory(*trajectory);
-      *republish_remaining = 3;
-      RCLCPP_INFO(node->get_logger(), "Planned initial trajectory from goal parameter.");
-    }
-  } else {
-    RCLCPP_INFO(
-      node->get_logger(),
-      "No goal parameter provided. Waiting for goals on 'goal_path' topic...");
-  }
 
   // ------------------------------------------------------------------
   // Subscribe to "goal_path" for dynamic goals from the state machine
@@ -109,9 +84,7 @@ int main(int argc, char ** argv)
       }
     });
 
-  // ------------------------------------------------------------------
-  // Republish timer (1 Hz) so late-joining subscribers get the trajectory
-  // ------------------------------------------------------------------
+  // Republish timer (1 Hz)
   auto publish_timer = node->create_wall_timer(
     std::chrono::seconds(1),
     [&planner, trajectory, republish_remaining]() {

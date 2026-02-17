@@ -162,6 +162,8 @@ class StateMachineNode(Node):
                 "z": marker.pose.position.z,
             }
 
+            self.get_logger().info(f"[state-machine] Lantern detected: ID {marker.id} at ({marker.pose.position.x:.2f}, {marker.pose.position.y:.2f}, {marker.pose.position.z:.2f})")
+
         if self.detected_lanterns:
             self._save_lantern_positions()
 
