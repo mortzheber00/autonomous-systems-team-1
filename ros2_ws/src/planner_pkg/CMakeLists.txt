@@ -83,6 +83,11 @@ target_link_libraries(global_planner_node
   octomath
 )
 
+target_link_libraries(global_planner_node
+  octomap
+  octomath
+)
+
 # Install executables
 install(TARGETS local_planner_node global_planner_node
   DESTINATION lib/${PROJECT_NAME}
