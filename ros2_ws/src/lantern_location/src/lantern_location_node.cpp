@@ -18,7 +18,6 @@
 #include "tf2_ros/buffer.h"
 #include "tf2_geometry_msgs/tf2_geometry_msgs.hpp"
 
-// Define the namespace for this node
 namespace lantern_location
 {
 
@@ -26,12 +25,12 @@ namespace lantern_location
 using SyncPolicy = message_filters::sync_policies::ApproximateTime<
   sensor_msgs::msg::Image, sensor_msgs::msg::Image>;
 
-// Structure to track detected lanterns
 struct DetectedLantern
 {
-  geometry_msgs::msg::Point position;  // Average position in world frame
-  geometry_msgs::msg::Point sum;       // Sum of all detections for true average
-  int update_count;                     // Number of times this lantern was updated
+  geometry_msgs::msg::Point position;   // Average position
+  geometry_msgs::msg::Point sum;        // Sum of all detections for true average
+  int update_count;                     // Updates per lantern
+  rclcpp::Time last_seen;               // Last time  lantern was updated
 };
 
 class LanternLocationNode : public rclcpp::Node
@@ -44,17 +43,21 @@ public:
   {
     RCLCPP_INFO(get_logger(), "Initializing Lantern Location Node...");
     
-    // Depth scale parameter (conversion from depth units to meters)
-    this->declare_parameter("depth_scale", 0.001);  // mm to meters
+    // Depth scale parameter 
+    this->declare_parameter("depth_scale", 0.001);  // conversion of mm to meters
     depth_scale_ = this->get_parameter("depth_scale").as_double();
 
-    // Processing frame skip parameter (process every Nth frame)
+    // Processing frame skip parameter
     this->declare_parameter("frame_skip", 5);  // Process every 5th frame by default
     frame_skip_ = this->get_parameter("frame_skip").as_int();
 
-    // Lantern matching distance threshold (meters in world coordinates)
-    this->declare_parameter("matching_distance_threshold", 20.0);
+    // Lantern matching distance threshold 
+    this->declare_parameter("matching_distance_threshold", 20.0); // 20 meters in world coordinates
     matching_distance_threshold_ = this->get_parameter("matching_distance_threshold").as_double();
+
+    // Lantern timeout
+    this->declare_parameter("lantern_timeout", 5.0); // 5 seconds
+    lantern_timeout_ = this->get_parameter("lantern_timeout").as_double();
 
     // Minimum updates before lantern is confirmed
     this->declare_parameter("min_updates_to_confirm", 3);
@@ -102,7 +105,7 @@ public:
   }
 
 private:
-  // Synchronized callback - called when both images arrive with similar timestamps
+  // Synchronized callback (when both images arrive with similar timestamps)
   void synchronized_callback(
     const sensor_msgs::msg::Image::ConstSharedPtr& semantic_msg,
     const sensor_msgs::msg::Image::ConstSharedPtr& depth_msg)
@@ -154,7 +157,6 @@ private:
 
     for (size_t i = 0; i < num_pixels; ++i) {
       // Check if semantic pixel is non-zero (object of interest)
-      // For rgb8: check if any channel is non-zero
       const size_t sem_idx = i * 3;
       if (semantic_data[sem_idx] != 0 || 
           semantic_data[sem_idx + 1] != 0 || 
@@ -244,14 +246,14 @@ private:
     int valid_points = 0;
 
     // Setup point cloud structure (only reallocate if size changed)
-    // Publish point cloud in world frame to match lantern markers
+    // Publish point cloud in camera frame
     if (cloud_->width != width || cloud_->height != height) {
-      setup_pointcloud_fields(*cloud_, width, height, "world");
+      setup_pointcloud_fields(*cloud_, width, height, frame_id);
     }
     cloud_->header.stamp = timestamp;
-    cloud_->header.frame_id = "world";
+    cloud_->header.frame_id = frame_id; // Camera frame
 
-    // Compute 3D points in camera frame, transform to world, and accumulate for averaging
+    // Compute 3D points in camera frame, accumulate for averaging
     sensor_msgs::PointCloud2Iterator<float> iter_x(*cloud_, "x");
     sensor_msgs::PointCloud2Iterator<float> iter_y(*cloud_, "y");
     sensor_msgs::PointCloud2Iterator<float> iter_z(*cloud_, "z");
@@ -262,26 +264,19 @@ private:
       if (depth_value == 0) {
         *iter_x = *iter_y = *iter_z = std::numeric_limits<float>::quiet_NaN();
       } else {
-        // Convert pixel to 3D point in camera frame
+        // Convert pixel to 3D point 
         const int u = i % width;
         const int v = i / width;
         const float z = depth_value * depth_scale_;
         const float x = (u - principal_point_x_) * z / focal_length_x_;
         const float y = (v - principal_point_y_) * z / focal_length_y_;
 
-        // Transform point from camera to world frame
-        geometry_msgs::msg::Point point_camera;
-        point_camera.x = x;
-        point_camera.y = y;
-        point_camera.z = z;
-        geometry_msgs::msg::Point point_world = transform_to_world(point_camera, frame_id, timestamp);
+        // Store in point cloud
+        *iter_x = x;
+        *iter_y = y;
+        *iter_z = z;
 
-        // Store in point cloud (now in world frame)
-        *iter_x = point_world.x;
-        *iter_y = point_world.y;
-        *iter_z = point_world.z;
-
-        // Accumulate for average calculation (in camera frame for consistency)
+        // Accumulate for average calculation
         sum_x += x;
         sum_y += y;
         sum_z += z;
@@ -292,7 +287,7 @@ private:
     // Publish point cloud
     pointcloud_pub_->publish(*cloud_);
 
-    // Calculate and publish lantern location if we have valid points
+    // Calculate and publish lantern location
     if (valid_points > 0) {
       geometry_msgs::msg::Point avg_position_camera;
       avg_position_camera.x = sum_x / valid_points;
@@ -302,26 +297,26 @@ private:
       // Transform to world coordinates using TF2
       geometry_msgs::msg::Point lantern_world = transform_to_world(avg_position_camera, frame_id, timestamp);
 
-      // Update or add lantern to tracking list (in world coordinates)
+      // Update or add lantern to tracking list 
       update_lantern_list(lantern_world, timestamp);
     }
     
-    // Clean up unconfirmed lanterns periodically (every 30 frames)
+    // Clean up unconfirmed/stale lanterns periodically 
     cleanup_counter_++;
     if (cleanup_counter_ >= 30) {
-      cleanup_unconfirmed_lanterns();
+      cleanup_unconfirmed_lanterns(timestamp); // every 30 frames
       cleanup_counter_ = 0;
     }
     
-    // Always publish all confirmed lanterns (even when not currently detected)
+    // Always publish all confirmed lanterns
     publish_lantern_locations(timestamp);
   }
 
-  // Update or add a lantern to the tracking list (in world coordinates)
+  // Update lantern tracking list 
   void update_lantern_list(const geometry_msgs::msg::Point& new_position_world,
                           const rclcpp::Time& timestamp)
   {
-    // Check if this lantern matches any existing lantern (within threshold distance in world frame)
+    // Check if lantern matches any existing lantern
     int closest_idx = -1;
     double min_distance = matching_distance_threshold_;
 
@@ -339,7 +334,7 @@ private:
     }
 
     if (closest_idx >= 0) {
-      // Update existing lantern - calculate true average of all detections
+      // Update existing lantern
       auto& lantern = detected_lanterns_[closest_idx];
       
       // Add new detection to sum
@@ -347,34 +342,42 @@ private:
       lantern.sum.y += new_position_world.y;
       lantern.sum.z += new_position_world.z;
       lantern.update_count++;
+      lantern.last_seen = timestamp;
       
       // Calculate true average position
       lantern.position.x = lantern.sum.x / lantern.update_count;
       lantern.position.y = lantern.sum.y / lantern.update_count;
       lantern.position.z = lantern.sum.z / lantern.update_count;
     } else {
-      // Add new lantern (no existing lantern within threshold distance in world coordinates)
+      // Add new lantern
       DetectedLantern new_lantern;
       new_lantern.position = new_position_world;
       new_lantern.sum = new_position_world;  // Initialize sum
       new_lantern.update_count = 1;
+      new_lantern.last_seen = timestamp;
       detected_lanterns_.push_back(new_lantern);
     }
   }
 
-  // Remove lanterns that haven't been confirmed (not enough updates)
-  void cleanup_unconfirmed_lanterns()
+  // Remove lanterns that haven't been seen recently and are unconfirmed
+  void cleanup_unconfirmed_lanterns(const rclcpp::Time& current_time)
   {
-    // Remove lanterns with too few updates
     detected_lanterns_.erase(
       std::remove_if(detected_lanterns_.begin(), detected_lanterns_.end(),
-        [this](const DetectedLantern& lantern) {
-          return lantern.update_count < min_updates_to_confirm_;
+        [this, &current_time](const DetectedLantern& lantern) {
+          double time_since_last_seen = (current_time - lantern.last_seen).seconds();
+          
+          // If unconfirmed and not seen for a while, remove it
+          if (lantern.update_count < min_updates_to_confirm_ && 
+              time_since_last_seen > lantern_timeout_) {
+            return true;
+          }
+          return false;
         }),
       detected_lanterns_.end());
   }
 
-  // Publish all detected lanterns as visual markers (in world frame)
+  // Publish all detected lanterns
   void publish_lantern_locations(const rclcpp::Time& timestamp)
   {
     visualization_msgs::msg::MarkerArray marker_array;
@@ -382,43 +385,43 @@ private:
     for (size_t i = 0; i < detected_lanterns_.size(); ++i) {
       const auto& lantern = detected_lanterns_[i];
       
-      // Only publish confirmed lanterns (with enough updates)
+      // Only publish confirmed lanterns
       if (lantern.update_count < min_updates_to_confirm_) {
         continue;
       }
       
       visualization_msgs::msg::Marker marker;
       marker.header.stamp = timestamp;
-      marker.header.frame_id = "world";  // Publish in world frame
+      marker.header.frame_id = "world"; 
       marker.ns = "lanterns";
       marker.id = i;
       marker.type = visualization_msgs::msg::Marker::SPHERE;
       marker.action = visualization_msgs::msg::Marker::ADD;
       
-      // Set position (already in world coordinates)
+      // Set position
       marker.pose.position = lantern.position;
       marker.pose.orientation.w = 1.0;
       
-      // Set scale (0.3m diameter sphere)
+      // Set scale
       marker.scale.x = 5.0;
       marker.scale.y = 5.0;
       marker.scale.z = 5.0;
       
-      // Set color (orange/yellow for lantern, brighter with more updates)
+      // Set color 
       float brightness = std::min(1.0f, 0.5f + 0.1f * lantern.update_count);
       marker.color.r = 1.0;
       marker.color.g = 0.6 * brightness;
       marker.color.b = 0.0;
-      marker.color.a = 0.8;  // Slight transparency
+      marker.color.a = 0.8;  
       
-      // Infinite lifetime for confirmed lanterns (they persist until manually removed)
-      marker.lifetime = rclcpp::Duration::from_seconds(0);
+      marker.lifetime = rclcpp::Duration::from_seconds(0); 
       
       marker_array.markers.push_back(marker);
     }
 
     lantern_locations_pub_->publish(marker_array);
   }
+
 
   // Synchronized subscribers
   message_filters::Subscriber<sensor_msgs::msg::Image> semantic_sub_;
@@ -442,6 +445,7 @@ private:
   sensor_msgs::msg::PointCloud2::SharedPtr cloud_;
 
   // Camera intrinsics (from CameraInfo subscription)
+  double lantern_timeout_;
   bool have_camera_info_ = false;
   double focal_length_x_;
   double focal_length_y_;
