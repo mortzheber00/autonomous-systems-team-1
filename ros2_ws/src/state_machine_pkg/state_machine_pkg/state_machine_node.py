@@ -222,10 +222,9 @@ class StateMachineNode(Node):
             return
 
         if self.state == MissionState.EXPLORE:
-            self._publish_enable_local_planner(True)
-            self._publish_enable_rrt(True)
-            self._publish_enable_global_planner(True)
-            if self._explore_complete():
+            #self._publish_enable_local_planner(True)
+            #self._publish_enable_rrt(True)
+            if self._explore_complete():  # timout checkk
                 self._transition_to(MissionState.LAND)
             return
 
@@ -258,7 +257,10 @@ class StateMachineNode(Node):
             self._cancel_planner()
             self._publish_enable_local_planner(True)
             self._publish_enable_rrt(True)
-            self._publish_enable_global_planner(True)
+            # Delay global planner by 5 seconds
+            self._global_planner_delay_timer = self.create_timer(
+                10.0, self._delayed_enable_global_planner
+            )
         elif new_state in (MissionState.TAKEOFF, MissionState.GO_TO_ENTRANCE, MissionState.LAND, MissionState.DONE):
             self._publish_enable_local_planner(False)
             self._publish_enable_rrt(False)
@@ -266,6 +268,13 @@ class StateMachineNode(Node):
 
         if new_state == MissionState.LAND:
             self._save_lantern_positions()
+
+    def _delayed_enable_global_planner(self):
+        """One-shot callback: enable global planner then cancel the timer."""
+        if self.state == MissionState.EXPLORE:
+            self._publish_enable_global_planner(True)
+            self.get_logger().info("[state-machine] Global planner enabled (5 s delay)")
+        self._global_planner_delay_timer.cancel()
 
     def _publish_enable_local_planner(self, enabled: bool):
         msg = Bool()
