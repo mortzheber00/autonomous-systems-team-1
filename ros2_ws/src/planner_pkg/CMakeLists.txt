@@ -18,6 +18,7 @@ find_package(tf2_eigen REQUIRED)
 find_package(tf2_geometry_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
 find_package(trajectory_msgs REQUIRED)
+find_package(std_msgs REQUIRED)
 find_package(Eigen3 REQUIRED)
 
 if(BUILD_TESTING)
@@ -55,6 +56,11 @@ ament_target_dependencies(local_planner_node
 
 # Add global planner node executable
 add_executable(global_planner_node src/global_planner_node.cpp)
+
+target_include_directories(global_planner_node PUBLIC
+  ${EIGEN3_INCLUDE_DIRS}
+)
+
 ament_target_dependencies(global_planner_node
   rclcpp
   geometry_msgs
@@ -62,6 +68,8 @@ ament_target_dependencies(global_planner_node
   octomap_msgs
   octomap
   visualization_msgs
+  std_msgs
+  Eigen3
 )
 
 # Install executables

@@ -6,7 +6,6 @@ Panels:
       Expanded:
         - /Global Options1
         - /Status1
-        - /TF1/Status1
       Splitter Ratio: 0.5
     Tree Height: 319
   - Class: rviz_common/Selection
@@ -60,6 +59,31 @@ Visualization Manager:
         Reliability Policy: Reliable
         Value: /occupied_cells_vis_array
       Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: Frontier Goals
+      Namespaces:
+        frontier_goals: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /frontier_goals_markers
+      Value: true
+    - Class: rviz_default_plugins/Marker
+      Enabled: true
+      Name: RRT Path
+      Namespaces:
+        "": true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        Filter size: 10
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /rrt_waypoint_path
+      Value: true
     - Class: rviz_default_plugins/Image
       Enabled: true
       Max Value: 1
@@ -89,8 +113,8 @@ Visualization Manager:
           Value: false
         Quadrotor/TrueState:
           Value: false
-        av:
-          Value: false
+        body:
+          Value: true
         camera:
           Value: false
         depth_camera:
@@ -106,7 +130,7 @@ Visualization Manager:
       Show Names: false
       Tree:
         world:
-          av:
+          body:
             {}
           true_body:
             camera:
@@ -132,6 +156,22 @@ Visualization Manager:
         History Policy: Keep Last
         Reliability Policy: Reliable
         Value: /Quadrotor/Sensors/SemanticCamera/image_raw
+      Value: true
+    - Class: rviz_default_plugins/MarkerArray
+      Enabled: true
+      Name: MarkerArray
+      Namespaces:
+        home: true
+        junction_arms: true
+        junction_labels: true
+        junctions: true
+        state: true
+      Topic:
+        Depth: 5
+        Durability Policy: Volatile
+        History Policy: Keep Last
+        Reliability Policy: Reliable
+        Value: /global_frontier_markers
       Value: true
   Enabled: true
   Global Options:
@@ -179,7 +219,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 37.475772857666016
+      Distance: 25.901203155517578
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -194,10 +234,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.4553983211517334
+      Pitch: 0.38039830327033997
       Target Frame: true_body
       Value: Orbit (rviz)
-      Yaw: 0.3903954029083252
+      Yaw: 5.9903883934021
     Saved: ~
 Window Geometry:
   Displays:

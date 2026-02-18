@@ -1,12 +1,15 @@
 /**
  * @file local_planner_node.cpp written by Phil Chudalla
- * @brief Frontier-Based Exploration Local Planner with Global Backtracking
- * This ROS 2 node implements a local planner that:
+ * @brief Simplified Frontier-Based Exploration Local Planner
+ * This ROS 2 node implements a simplified local planner that:
  * 1. Subscribes to Octomap updates from the mapping system
  * 2. Identifies frontier cells (boundaries between explored and unexplored space)
- * 3. Calculates exploration gain for each frontier
- * 4. Publishes the frontier with highest gain for the trajectory planner to execute
- * 5. Tracks flight history and backtracks to unexplored frontiers when none are found locally
+ * 3. Calculates exploration gain based on:
+ *    - Volumetric exploration gain (unknown voxels around frontier)
+ *    - Direction alignment with drone's current exploration direction
+ * 4. Publishes top 5 frontiers to the RRT planner
+ * 
+ * Safety checks and path validation are handled by the RRT planner.
  */
 
 #include <rclcpp/rclcpp.hpp>
@@ -14,17 +17,10 @@
 #include <octomap_msgs/conversions.h>
 #include <octomap_msgs/msg/octomap.hpp>
 #include <geometry_msgs/msg/point.hpp>
-#include <geometry_msgs/msg/transform.hpp>
-#include <geometry_msgs/msg/twist.hpp>
-#include <tf2/LinearMath/Quaternion.h>
-#include <tf2/LinearMath/Matrix3x3.h>
+#include <geometry_msgs/msg/pose_array.hpp>
 #include <tf2/LinearMath/Vector3.h>
-#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <nav_msgs/msg/path.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
-#include <visualization_msgs/msg/marker.hpp>
-#include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
 
 #include <vector>
 #include <cmath>
@@ -32,11 +28,12 @@
 #include <algorithm>
 
 /**
- * LocalPlannerNode - Frontier-Based Exploration Local Planner
- * * IMPROVEMENTS:
- * 1. Decoupled Planning from Mapping: Uses a 2Hz timer for planning instead of reacting to every map update.
- * 2. Goal Commitment: Stick to a goal until reached (tolerance) or blocked. Prevents twitching.
- * 3. Constant Trajectory Publishing: Keeps the controller happy even when not changing goals.
+ * LocalPlannerNode - Simplified Frontier-Based Exploration Local Planner
+ * 
+ * Simplified architecture:
+ * - Finds frontiers and calculates basic gains
+ * - Publishes best frontier to RRT planner
+ * - RRT handles safety checks and trajectory generation
  */
 class LocalPlannerNode : public rclcpp::Node
 {
@@ -44,49 +41,44 @@ public:
   LocalPlannerNode() : Node("local_planner_node")
   {
     // --- Publishers -----
-    // Create publisher for frontier goals
-    frontier_publisher_ = create_publisher<geometry_msgs::msg::Point>("/frontier_goal", 10);
-    marker_publisher_ = create_publisher<visualization_msgs::msg::Marker>("/frontier_goal_marker", 10);
-    trajectory_publisher_ = create_publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>("/command/trajectory", 10);
+    // Create publisher for top 5 frontier goals (to RRT planner)
+    frontier_publisher_ = create_publisher<geometry_msgs::msg::PoseArray>("/frontier_goals", 10);
+    marker_publisher_ = create_publisher<visualization_msgs::msg::MarkerArray>("/frontier_goals_markers", 10);
     
     // ----- Subscribers -----
-    // Subscribe to Octomap updates and bind it to octomap callback (does frontier evaluation)
+    // Subscribe to Octomap updates
     octomap_subscription_ = create_subscription<octomap_msgs::msg::Octomap>(
       "/octomap_full",
-      rclcpp::QoS(10).best_effort(), // Best effort often better for heavy map data
+      rclcpp::QoS(10).best_effort(),
       std::bind(&LocalPlannerNode::octomap_callback, this, std::placeholders::_1)
     );
     
-    // Subscriber: Odometry
+    // Subscribe to odometry for position and movement tracking
     odom_subscription_ = create_subscription<nav_msgs::msg::Odometry>(
       "/current_state_est", 10,
       std::bind(&LocalPlannerNode::odom_callback, this, std::placeholders::_1)
     );
-    
-    last_frontier_found_time_ = this->now();
 
     // Timer: Run planning loop at 2 Hz (500ms)
-    // This stabilizes the behavior by not replanning on every single map voxel change.
     planning_timer_ = create_wall_timer(
         std::chrono::milliseconds(500),
         std::bind(&LocalPlannerNode::planning_loop, this)
     );
     
     // Initialize State
-    goal_active_ = false;
     current_octree_ = nullptr;
 
-    RCLCPP_INFO(get_logger(), "Local Planner Node initialized with Stabilized Loop (2Hz)");
-    RCLCPP_INFO(get_logger(), "Global Planner handles backtracking when no local frontiers found");
+    RCLCPP_INFO(get_logger(), "Simplified Local Planner Node initialized (2Hz planning)");
+    RCLCPP_INFO(get_logger(), "Publishing top 5 frontiers to RRT planner for safety-aware path planning");
   }
+
 
 private:
   // ---------------------------------------------------------------------------
   // Member Variables
   // ---------------------------------------------------------------------------
-  rclcpp::Publisher<geometry_msgs::msg::Point>::SharedPtr frontier_publisher_;
-  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr marker_publisher_;
-  rclcpp::Publisher<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr trajectory_publisher_;
+  rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr frontier_publisher_;
+  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr marker_publisher_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscription_;
   rclcpp::TimerBase::SharedPtr planning_timer_;
@@ -94,40 +86,17 @@ private:
   // Data Storage
   std::shared_ptr<octomap::OcTree> current_octree_;
   geometry_msgs::msg::Point last_drone_position_;
-  tf2::Quaternion last_drone_orientation_;
-    rclcpp::Time last_frontier_found_time_;
   
   // Moving average of drone movement direction
   std::vector<tf2::Vector3> movement_history_; 
 
-  // State Machine for Goal Persistence
-  bool goal_active_;
-  geometry_msgs::msg::Point current_goal_;
-
-  // Frontier info structure
-  struct FrontierInfo {
-    octomap::point3d position;
-    float exploration_gain;
-    bool visited;
-    int id;
-    
-    FrontierInfo(octomap::point3d pos, float gain, int frontier_id)
-      : position(pos), exploration_gain(gain), visited(false), id(frontier_id) {}
-  };
-
   // Configuration
   const float exploration_radius_ = 10.0;    // Radius around frontier to calculate gain
-  const float occupied_threshold_ = 0.5;    // Occupancy probability threshold
-  const float search_radius_ = 60.0;        // Search radius
-  const float exploration_weight_ = 2.0;    // Weight for exploration gain
-  const float direction_weight_ = 1.0;      // Weight for direction gain
-  const float x_limit_position_ = -370.0;   // Cave boundary limit
-  const float frontier_proximity_threshold_ = 2.0;  // Distance to consider frontiers as same
+  const float occupied_threshold_ = 0.5;     // Occupancy probability threshold
+  const float search_radius_ = 60.0;         // Search radius for frontiers
+  const float x_limit_position_ = -370.0;    // Cave boundary limit
   const size_t movement_history_size_ = 10;  // Number of movement samples for moving average
-  const float safety_radius_ = 10.0;  //Safety radius for obstacle penalty
-  
-  // Stability Parameters
-  const double goal_reached_tolerance_ = 20.0; // Meters. Drone is "close enough" to switch goals
+  const float min_publish_gain_ = 1.3f;      // Minimum gain to publish a frontier (filters dead-end noise)
   
   // ---------------------------------------------------------------------------
   // Callbacks
@@ -154,20 +123,13 @@ private:
     }
     
     last_drone_position_ = new_pos;
-    last_drone_orientation_ = tf2::Quaternion(
-      msg->pose.pose.orientation.x,
-      msg->pose.pose.orientation.y,
-      msg->pose.pose.orientation.z,
-      msg->pose.pose.orientation.w);
   }
 
   void octomap_callback(const octomap_msgs::msg::Octomap::SharedPtr msg)
   {
-    // Simply convert and store the tree.
-    // We do NOT plan here. This prevents the "twitching".
+    // Convert and store the tree
     octomap::AbstractOcTree* tree = octomap_msgs::msgToMap(*msg);
     if (tree) {
-        // dynamic_cast to OcTree. If it fails, tree remains null/old one stays.
         octomap::OcTree* octree = dynamic_cast<octomap::OcTree*>(tree);
         if (octree) {
             current_octree_ = std::shared_ptr<octomap::OcTree>(octree);
@@ -189,56 +151,26 @@ private:
         return;
     }
 
-    bool need_new_goal = false;
+    // Find top 5 frontiers
+    std::vector<geometry_msgs::msg::Point> top_frontiers = find_top_frontiers(5);
 
-    // 1. Check existing goal status
-    if (goal_active_) {
-        double dist = std::sqrt(
-            std::pow(last_drone_position_.x - current_goal_.x, 2) +
-            std::pow(last_drone_position_.y - current_goal_.y, 2) +
-            std::pow(last_drone_position_.z - current_goal_.z, 2)
-        );
-
-        // Condition A: Reached?
-        if (dist < goal_reached_tolerance_) {
-            RCLCPP_INFO(get_logger(), "Goal reached (dist: %.2fm). Replanning.", dist);
-            need_new_goal = true;
+    if (!top_frontiers.empty()) {
+        RCLCPP_INFO(get_logger(), "Publishing %zu frontiers to RRT", top_frontiers.size());
+        
+        // Publish frontiers as PoseArray
+        geometry_msgs::msg::PoseArray frontier_array;
+        frontier_array.header.stamp = this->get_clock()->now();
+        frontier_array.header.frame_id = "world";
+        
+        for (const auto& frontier : top_frontiers) {
+            geometry_msgs::msg::Pose pose;
+            pose.position = frontier;
+            pose.orientation.w = 1.0;
+            frontier_array.poses.push_back(pose);
         }
-        // Condition B: Blocked?
-        else {
-            octomap::point3d goal_pt(current_goal_.x, current_goal_.y, current_goal_.z);
-            if (!is_point_visible(current_octree_.get(), goal_pt)) {
-                 RCLCPP_WARN(get_logger(), "Current goal path obstructed. Replanning.");
-                 need_new_goal = true;
-            }
-        }
-    } else {
-        need_new_goal = true;
-    }
-
-    // 2. Select Goal (if needed)
-    if (need_new_goal) {
-        geometry_msgs::msg::Point new_goal;
-        float best_gain = find_best_frontier(new_goal);
-
-        if (best_gain > 0.0) {
-            current_goal_ = new_goal;
-            goal_active_ = true;
-            RCLCPP_INFO(get_logger(), "New Frontier Selected: [%.1f, %.1f, %.1f, Gain: %.2f]", 
-                        new_goal.x, new_goal.y, new_goal.z, best_gain);
-            // Reset timer for local frontier discovery
-            last_frontier_found_time_ = this->now();
-        } else {
-            RCLCPP_WARN(get_logger(), "No valid frontiers found. Holding position.");
-            goal_active_ = false;
-        }
-    }
-
-    // 3. Publish Command
-    // We publish even if the goal hasn't changed to keep the controller active.
-    if (goal_active_) {
-        publish_trajectory(current_goal_);
-        publish_marker(current_goal_);
+        
+        frontier_publisher_->publish(frontier_array);
+        publish_markers(top_frontiers);
     }
   }
 
@@ -246,12 +178,12 @@ private:
   // Algorithm Implementations
   // ---------------------------------------------------------------------------
 
-  float find_best_frontier(geometry_msgs::msg::Point& result_point)
+  std::vector<geometry_msgs::msg::Point> find_top_frontiers(size_t num_frontiers)
   {
     // 1. Identify frontier points
     std::vector<octomap::point3d> frontier_points = get_frontier_points(current_octree_.get());
     
-    if (frontier_points.empty()) return 0.0;
+    if (frontier_points.empty()) return {};
     
     // 2. Filter frontiers (Cave constraints)
     std::vector<octomap::point3d> cave_frontiers;
@@ -261,10 +193,10 @@ private:
       }
     }
 
-    // Use cave frontiers if available
+    // Use cave frontiers if available, otherwise all frontiers
     const std::vector<octomap::point3d>& candidates = cave_frontiers.empty() ? frontier_points : cave_frontiers;
 
-    // 3. Downsampling optimization
+    // 3. Downsampling optimization (if too many candidates)
     std::vector<octomap::point3d> points_to_evaluate;
     if (candidates.size() > 50) {
       size_t stride = candidates.size() / 50;
@@ -275,27 +207,59 @@ private:
       points_to_evaluate = candidates;
     }
 
-    // 4. Score points
-    octomap::point3d best_point = points_to_evaluate[0];
-    float best_gain = -1.0;
+    // 4. Score all points and store in vector with gains
+    struct ScoredFrontier {
+      octomap::point3d point;
+      float gain;
+    };
+    std::vector<ScoredFrontier> scored_frontiers;
     
     for (const auto& point : points_to_evaluate) {
-      float exploration_gain = calculate_exploration_gain(current_octree_.get(), point, exploration_radius_);
+      // Volumetric exploration gain
+      float volume_gain = calculate_volumetric_gain(current_octree_.get(), point, exploration_radius_);
+      
+      // Direction alignment gain
       float direction_gain = calculate_direction_gain(point);
       
-      float total_gain = exploration_weight_ * exploration_gain + direction_weight_ * direction_gain;
+      // Combined gain
+      float total_gain = volume_gain * direction_gain;
       
-      if (total_gain > best_gain) {
-        best_gain = total_gain;
-        best_point = point;
-      }
+      scored_frontiers.push_back({point, total_gain});
     }
 
-    result_point.x = best_point.x();
-    result_point.y = best_point.y();
-    result_point.z = best_point.z();
+    // 5. Filter out low-gain frontiers (dead-end / already-explored noise)
+    scored_frontiers.erase(
+      std::remove_if(scored_frontiers.begin(), scored_frontiers.end(),
+        [this](const ScoredFrontier& f) { return f.gain < min_publish_gain_; }),
+      scored_frontiers.end());
 
-    return best_gain;
+    if (scored_frontiers.empty()) {
+      RCLCPP_INFO(get_logger(), "All frontiers below min gain threshold (%.2f) - area likely explored", min_publish_gain_);
+      return {};
+    }
+
+    // 6. Sort by gain (highest first)
+    std::sort(scored_frontiers.begin(), scored_frontiers.end(),
+              [](const ScoredFrontier& a, const ScoredFrontier& b) {
+                return a.gain > b.gain;
+              });
+
+    // 7. Return top N frontiers
+    std::vector<geometry_msgs::msg::Point> result;
+    size_t count = std::min(num_frontiers, scored_frontiers.size());
+    
+    for (size_t i = 0; i < count; ++i) {
+      geometry_msgs::msg::Point p;
+      p.x = scored_frontiers[i].point.x();
+      p.y = scored_frontiers[i].point.y();
+      p.z = scored_frontiers[i].point.z();
+      result.push_back(p);
+      
+      RCLCPP_INFO(get_logger(), "Frontier %zu: [%.1f, %.1f, %.1f] gain: %.2f",
+                   i, p.x, p.y, p.z, scored_frontiers[i].gain);
+    }
+
+    return result;
   }
 
   std::vector<octomap::point3d> get_frontier_points(octomap::OcTree* octree)
@@ -322,7 +286,7 @@ private:
         };
         
         bool is_frontier = false;
-        bool is_safe = true;
+        bool has_nearby_obstacle = false;
 
         for (auto& dir : directions) {
           octomap::point3d neighbor_point = 
@@ -332,48 +296,30 @@ private:
           // If neighbor doesn't exist in tree, it's unknown → this is a frontier
           if (!neighbor_node) {
             is_frontier = true;
-          } else if (neighbor_node->getOccupancy() > occupied_threshold_) {
-             // Neighbor is an obstacle -> unsafe
-             is_safe = false;
-             break;
+          } 
+          // Check if neighbor is occupied (too close to wall)
+          else if (neighbor_node->getOccupancy() > occupied_threshold_) {
+            has_nearby_obstacle = true;
           }
         }
         
-        if (is_frontier && is_safe) {
-          // Check visibility from drone to prevent selecting unreachable points
-          if (is_point_visible(octree, leaf_coordinate)) {
-             frontiers.push_back(leaf_coordinate);
-          }
+        // Only add frontier if it's valid and not directly adjacent to obstacles
+        if (is_frontier && !has_nearby_obstacle) {
+          frontiers.push_back(leaf_coordinate);
         }
       }
     }
     return frontiers;
   }
 
-  bool is_point_visible(octomap::OcTree* octree, const octomap::point3d& target)
-  {
-    octomap::point3d drone_pos(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
-    
-    octomap::point3d direction = target - drone_pos;
-    double length = direction.norm();
-
-    if (length < 0.1) return true;
-
-    octomap::point3d end_point;
-    // castRay: true = ignore unknown (treat as free). Returns true if obstacle HIT.
-    bool hit_obstacle = octree->castRay(drone_pos, direction, end_point, true, length);
-    
-    return !hit_obstacle;
-  }
-
-  float calculate_exploration_gain(octomap::OcTree* octree, const octomap::point3d& point, float radius)
+  float calculate_volumetric_gain(octomap::OcTree* octree, const octomap::point3d& point, float radius)
   {
     int unknown_voxels = 0;
     int total_voxels = 0;
     float voxel_size = octree->getResolution();
     float step_size = (voxel_size > 0.4f) ? voxel_size : 0.4f; // Optimization: Larger steps
     
-    // 1. Calculate Standard Exploration Gain
+    // Calculate volumetric exploration gain
     for (float dx = -radius; dx <= radius; dx += step_size) {
       for (float dy = -radius; dy <= radius; dy += step_size) {
         for (float dz = -radius; dz <= radius; dz += step_size) {
@@ -388,64 +334,60 @@ private:
 
     if (total_voxels == 0) return 0.0;
     float volume_gain = static_cast<float>(unknown_voxels) / static_cast<float>(total_voxels);
-
-    // 2. Safety Penalty
-    double min_dist = safety_radius_;
+    
+    // Add penalty for being too close to obstacles (encourage center of free space)
+    float min_obstacle_dist = 20.0f; // Start with large distance
     octomap::point3d end_point;
     
-    // Check 6 cardinal directions using raycasting to detect obstacles within safety_radius_
-    octomap::point3d directions[6] = {
-        octomap::point3d(1, 0, 0), octomap::point3d(-1, 0, 0),
-        octomap::point3d(0, 1, 0), octomap::point3d(0, -1, 0),
-        octomap::point3d(0, 0, 1), octomap::point3d(0, 0, -1)
-    };
-
+    // Check distance to obstacles in 26 directions (more robust than just cardinal)
+    std::vector<octomap::point3d> directions;
+    for(int x=-1; x<=1; x++) {
+      for(int y=-1; y<=1; y++) {
+        for(int z=-1; z<=1; z++) {
+          if(x==0 && y==0 && z==0) continue;
+          directions.push_back(octomap::point3d(x, y, z));
+        }
+      }
+    }
+    
     for (const auto& dir : directions) {
-        // castRay to find distance to obstacles
-        if (octree->castRay(point, dir, end_point, true, safety_radius_)) {
-            double dist = (end_point - point).norm();
-            if (dist < min_dist) {
-                min_dist = dist;
+        // Cast ray to find nearest obstacle in each direction
+        // Increased range to 20.0 to better find centers in large spaces
+        if (octree->castRay(point, dir, end_point, true, 20.0)) {
+            float dist = (end_point - point).norm();
+            if (dist < min_obstacle_dist) {
+                min_obstacle_dist = dist;
             }
         }
     }
+    
+    // Reward points that are further from walls (centered in passages)
+    // Penalize frontiers close to walls (user requirement: < 4m)
+    if (min_obstacle_dist < 4.0f) {
+      return volume_gain * 0.001f; // Heavy penalty to effectively ignore them
+    }
 
-    // Gradient penalty: Linear scaling from 0.1 (at wall) to 1.0 (at safety_radius_)
-    // This encourages the drone to center itself in corridors/caves
-    double penalty_factor = 0.1 + 0.9 * (min_dist / safety_radius_);
-
-    return volume_gain * penalty_factor;
+    // Use distance heavily in score to push towards center
+    // We remove the cap at 1.0 so points further away get higher scores
+    float centering_bonus = min_obstacle_dist;
+    
+    return volume_gain * centering_bonus;
   }
 
   /**
-   * Calculate direction gain based on drone movement history (moving average)
+   * Calculate direction gain based on drone movement history
    * 
-   * Instead of just using camera heading, this calculates gain based on the
-   * drone's overall movement direction over the last N samples (moving average).
-   * This biases frontier selection toward where the drone has been heading,
-   * making exploration more coherent and continuous.
+   * This calculates gain based on the drone's overall movement direction 
+   * over the last N samples (moving average). This biases frontier selection 
+   * toward where the drone has been heading, making exploration more coherent.
    * 
    * Returns [0, 1] where 1.0 = perfectly aligned with movement direction, 0.0 = opposite
    */
   float calculate_direction_gain(const octomap::point3d& frontier_point)
   {
-    // If we don't have enough movement history, fall back to camera heading
+    // If we don't have enough movement history, return neutral gain
     if (movement_history_.size() < 2) {
-      tf2::Vector3 cam_forward_body(1, 0, 0);
-      tf2::Vector3 cam_forward_world = tf2::quatRotate(last_drone_orientation_, cam_forward_body);
-      
-      tf2::Vector3 drone_pos(last_drone_position_.x, last_drone_position_.y, last_drone_position_.z);
-      tf2::Vector3 frontier_vec(frontier_point.x() - drone_pos.x(),
-                                frontier_point.y() - drone_pos.y(),
-                                frontier_point.z() - drone_pos.z());
-      if (frontier_vec.length() == 0) return 0.0f;
-      frontier_vec.normalize();
-      cam_forward_world.normalize();
-      
-      double dot = cam_forward_world.dot(frontier_vec);
-      dot = std::clamp(dot, -1.0, 1.0);
-      float gain = static_cast<float>(cos(acos(dot)));
-      return (gain + 1.0f) / 2.0f;
+      return 0.5f;
     }
     
     // Calculate average movement direction from history
@@ -465,86 +407,48 @@ private:
     tf2::Vector3 frontier_vec(frontier_point.x() - drone_pos.x(),
                               frontier_point.y() - drone_pos.y(),
                               frontier_point.z() - drone_pos.z());
-    
-    if (frontier_vec.length() == 0) return 0.0f;
     frontier_vec.normalize();
 
-// Compute angle between average movement direction and frontier direction
-    double dot = avg_movement.dot(frontier_vec);
-    dot = std::clamp(dot, -1.0, 1.0);
-    double angle = acos(dot);
-
-    // Normalize: 1.0 if perfectly aligned, 0.0 if opposite
-    float gain = static_cast<float>(cos(angle));
-    gain = (gain + 1.0f) / 2.0f;
-    return gain;
+    // Dot product gives alignment: 1.0 = same direction, -1.0 = opposite
+    float alignment = avg_movement.dot(frontier_vec);
+    
+    // Map from [-1, 1] to [0, 1]
+    return (alignment + 1.0f) / 2.0f;
   }
 
   // ---------------------------------------------------------------------------
   // Publishing Helpers
   // ---------------------------------------------------------------------------
 
-  void publish_trajectory(const geometry_msgs::msg::Point& target)
+  void publish_markers(const std::vector<geometry_msgs::msg::Point>& frontiers)
   {
-    trajectory_msgs::msg::MultiDOFJointTrajectory trajectory_msg;
-    trajectory_msg.header.stamp = this->get_clock()->now();
-    trajectory_msg.header.frame_id = "world"; // Ensure "map" or "world" is correct for your setup
-    trajectory_msg.joint_names.push_back("base_link");
-
-    trajectory_msgs::msg::MultiDOFJointTrajectoryPoint point;
-    geometry_msgs::msg::Transform transform;
-    transform.translation.x = target.x;
-    transform.translation.y = target.y;
-    transform.translation.z = target.z;
+    visualization_msgs::msg::MarkerArray marker_array;
     
-    // Calculate desired yaw based on direction to frontier
-    double dx = target.x - last_drone_position_.x;
-    double dy = target.y - last_drone_position_.y;
-    double yaw = atan2(dy, dx);
-
-    tf2::Quaternion q;
-    q.setRPY(0, 0, yaw);
-
-    transform.rotation.x = q.x();
-    transform.rotation.y = q.y();
-    transform.rotation.z = q.z();
-    transform.rotation.w = q.w(); 
-
-    point.transforms.push_back(transform);
-
-    // Populate velocities and accelerations (Zero for waypoint mode)
-    geometry_msgs::msg::Twist velocity;
-    geometry_msgs::msg::Twist acceleration;
-    point.velocities.push_back(velocity);
-    point.accelerations.push_back(acceleration);
-
-    trajectory_msg.points.push_back(point);
+    for (size_t i = 0; i < frontiers.size(); ++i) {
+      visualization_msgs::msg::Marker marker;
+      marker.header.frame_id = "world";
+      marker.header.stamp = this->get_clock()->now();
+      marker.ns = "frontier_goals";
+      marker.id = i;
+      marker.type = visualization_msgs::msg::Marker::SPHERE;
+      marker.action = visualization_msgs::msg::Marker::ADD;
+      marker.pose.position = frontiers[i];
+      marker.pose.orientation.w = 1.0;
+      marker.scale.x = 2.0;
+      marker.scale.y = 2.0;
+      marker.scale.z = 2.0;
+      marker.color.a = 0.8;
+      
+      // Color gradient: best (green) to worst (yellow)
+      float ratio = static_cast<float>(i) / std::max(1.0, static_cast<double>(frontiers.size() - 1));
+      marker.color.r = ratio;
+      marker.color.g = 1.0;
+      marker.color.b = 0.0;
+      
+      marker_array.markers.push_back(marker);
+    }
     
-    trajectory_publisher_->publish(trajectory_msg);
-    
-    // Also publish the point for debug/legacy
-    frontier_publisher_->publish(target);
-  }
-
-  void publish_marker(const geometry_msgs::msg::Point& target)
-  {
-    visualization_msgs::msg::Marker marker;
-    marker.header.frame_id = "world";
-    marker.header.stamp = this->get_clock()->now();
-    marker.ns = "frontier_goal";
-    marker.id = 0;
-    marker.type = visualization_msgs::msg::Marker::SPHERE;
-    marker.action = visualization_msgs::msg::Marker::ADD;
-    marker.pose.position = target;
-    marker.pose.orientation.w = 1.0;
-    marker.scale.x = 2.0;
-    marker.scale.y = 2.0;
-    marker.scale.z = 2.0;
-    marker.color.a = 0.8;
-    marker.color.r = 0.0;
-    marker.color.g = 1.0;
-    marker.color.b = 0.0;
-    marker_publisher_->publish(marker);
+    marker_publisher_->publish(marker_array);
   }
 };
 
