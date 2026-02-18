@@ -29,6 +29,8 @@ public:
 
   void setMaxSpeed(double max_v);
 
+  void setWaypoints(const std::vector<Eigen::Vector3d> & waypoints);
+
   bool planTrajectory(
     const Eigen::VectorXd & goal_pos,
     const Eigen::VectorXd & goal_vel,

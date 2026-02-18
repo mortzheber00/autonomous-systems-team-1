@@ -83,6 +83,12 @@ void BasicPlanner::setMaxSpeed(const double max_v)
   max_v_ = max_v;
 }
 
+// Method to override intermediate waypoints.
+void BasicPlanner::setWaypoints(const std::vector<Eigen::Vector3d> & waypoints)
+{
+  waypoints_ = waypoints;
+}
+
 // Plans a trajectory from the current position to a goal position and velocity
 // we neglect attitude here for simplicity
 bool BasicPlanner::planTrajectory(
@@ -140,45 +146,16 @@ bool BasicPlanner::planTrajectory(
       vertices.push_back(intermediate);
   }
 
-  //auto tunnel_entry_point = Eigen::Vector3d(25.0, 39.0, 11.0);
-  //mav_trajectory_generation::Vertex tunnel_entry(dimension);
-  //tunnel_entry.addConstraint(
-  //    mav_trajectory_generation::derivative_order::POSITION,
-  //    tunnel_entry_point);
-  //tunnel_entry.addConstraint(
-  //    mav_trajectory_generation::derivative_order::VELOCITY,
-  //    Eigen::Vector3d(-0.4, 0.0, 0.0));
-  //tunnel_entry.addConstraint(
-  //    mav_trajectory_generation::derivative_order::ACCELERATION,
-  //    Eigen::Vector3d(-0.1, 0.0, 0.0));
-  //vertices.push_back(tunnel_entry);
-//
-  //auto temp_stop_point = Eigen::Vector3d(13.5, 39.0, 11.0);
-  //mav_trajectory_generation::Vertex stop(dimension);
-  //stop.addConstraint(
-  //    mav_trajectory_generation::derivative_order::POSITION,
-  //    temp_stop_point);
-  //stop.addConstraint(
-  //    mav_trajectory_generation::derivative_order::VELOCITY,
-  //    Eigen::Vector3d::Zero());
-  //stop.addConstraint(
-  //    mav_trajectory_generation::derivative_order::ACCELERATION,
-  //    Eigen::Vector3d::Zero());
-  //vertices.push_back(stop);
-//
-  //auto transition_point2 = Eigen::Vector3d(2.0, 39.0, 11.0);
-  //mav_trajectory_generation::Vertex transition2(dimension);
-  //transition2.addConstraint(
-  //    mav_trajectory_generation::derivative_order::POSITION,
-  //    transition_point2);
-  //vertices.push_back(transition2);
-//
-  //auto transition_point = Eigen::Vector3d(-2.0, 8.0, 4.0);
-  //mav_trajectory_generation::Vertex transition(dimension);
-  //transition.addConstraint(
-  //    mav_trajectory_generation::derivative_order::POSITION,
-  //    transition_point);
-  //vertices.push_back(transition);
+  // If there are no intermediate waypoints the optimizer would have only
+  // two fully-constrained vertices and zero free variables, which causes
+  // a crash.  Insert the midpoint so it has something to optimise.
+  if (waypoints_.empty()) {
+    Eigen::Vector3d mid = 0.5 * (current_pose_.translation() + goal_pos.head<3>());
+    mav_trajectory_generation::Vertex midpoint(dimension);
+    midpoint.addConstraint(
+      mav_trajectory_generation::derivative_order::POSITION, mid);
+    vertices.push_back(midpoint);
+  }
 
   //
   // ~~~~ end solution

@@ -205,9 +205,9 @@ def generate_launch_description():
             state_estimate_corruptor_disabled,
             #unity_state,
             w_to_unity,
-            mapping_launch,
-            controller_node,
-            lantern_location_node,
+            #mapping_launch,
+            #controller_node,
+            #lantern_location_node,
             rviz_node,
             *static_tf_nodes,
         ]
