@@ -65,8 +65,6 @@ public:
       "/state_machine/enable_local_planner", 1,
       std::bind(&LocalPlannerNode::enable_callback, this, std::placeholders::_1)
     );
-    
-    last_frontier_found_time_ = this->now();
 
     // Timer: Run planning loop at 2 Hz (500ms)
     planning_timer_ = create_wall_timer(
@@ -171,7 +169,7 @@ private:
 
     // enable by state-machine
     if (!local_planner_enabled_) {
-      return;
+        return;
     }
 
     // Find top 5 frontiers

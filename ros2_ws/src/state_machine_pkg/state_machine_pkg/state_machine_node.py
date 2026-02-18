@@ -13,7 +13,7 @@ from rclpy.exceptions import ParameterUninitializedException
 
 from geometry_msgs.msg import PoseStamped, Quaternion
 from nav_msgs.msg import Odometry, Path
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 from visualization_msgs.msg import MarkerArray
 
 from ament_index_python.packages import get_package_share_directory
@@ -86,6 +86,16 @@ class StateMachineNode(Node):
             "/state_machine/enable_local_planner",
             enable_qos,
         )
+        self.enable_rrt_pub = self.create_publisher(
+            Bool,
+            "/state_machine/enable_rrt",
+            enable_qos,
+        )
+        self.enable_global_planner_pub = self.create_publisher(
+            Bool,
+            "/state_machine/enable_global_planner",
+            enable_qos,
+        )
 
         self.odom_sub = self.create_subscription(
             Odometry,
@@ -101,6 +111,13 @@ class StateMachineNode(Node):
             10,
         )
 
+        self.global_planner_state_sub = self.create_subscription(
+            String,
+            "/exploration_state",
+            self.global_planner_state_callback,
+            10,
+        )
+
         timer_period = 1.0 / max(self.command_rate_hz, 0.1)
         self.timer = self.create_timer(timer_period, self.on_timer)
 
@@ -110,6 +127,8 @@ class StateMachineNode(Node):
             f"Entry waypoints: {len(self.entry_waypoints)} waypoint(s) -> goal {self.entry_goal}"
         )
         self._publish_enable_local_planner(False)
+        self._publish_enable_rrt(False)
+        self._publish_enable_global_planner(False)
 
     def _get_vec_param(self, name: str, optional: bool = False):
         try:
@@ -167,6 +186,11 @@ class StateMachineNode(Node):
         if self.detected_lanterns:
             self._save_lantern_positions()
 
+    def global_planner_state_callback(self, msg: String):
+        if msg.data == "DONE" and self.state == MissionState.EXPLORE:
+            self.get_logger().info("[state-machine] Received explore_complete from global planner")
+            self._transition_to(MissionState.LAND)
+
     def on_timer(self):
         if not self.have_odom:
             return
@@ -199,6 +223,8 @@ class StateMachineNode(Node):
 
         if self.state == MissionState.EXPLORE:
             self._publish_enable_local_planner(True)
+            self._publish_enable_rrt(True)
+            self._publish_enable_global_planner(True)
             if self._explore_complete():
                 self._transition_to(MissionState.LAND)
             return
@@ -215,6 +241,8 @@ class StateMachineNode(Node):
 
         if self.state == MissionState.DONE:
             self._publish_enable_local_planner(False)
+            self._publish_enable_rrt(False)
+            self._publish_enable_global_planner(False)
 
     def _transition_to(self, new_state: MissionState):
         if new_state == self.state:
@@ -229,13 +257,14 @@ class StateMachineNode(Node):
             # Stop the waypoint planner so it doesn't conflict with the local planner
             self._cancel_planner()
             self._publish_enable_local_planner(True)
+            self._publish_enable_rrt(True)
+            self._publish_enable_global_planner(True)
         elif new_state in (MissionState.TAKEOFF, MissionState.GO_TO_ENTRANCE, MissionState.LAND, MissionState.DONE):
             self._publish_enable_local_planner(False)
+            self._publish_enable_rrt(False)
+            self._publish_enable_global_planner(False)
 
         if new_state == MissionState.LAND:
-            self._save_lantern_positions()
-
-        if new_state == MissionState.DONE:
             self._save_lantern_positions()
 
     def _publish_enable_local_planner(self, enabled: bool):
@@ -243,8 +272,18 @@ class StateMachineNode(Node):
         msg.data = enabled
         self.enable_local_planner_pub.publish(msg)
 
+    def _publish_enable_rrt(self, enabled: bool):
+        msg = Bool()
+        msg.data = enabled
+        self.enable_rrt_pub.publish(msg)
+
+    def _publish_enable_global_planner(self, enabled: bool):
+        msg = Bool()
+        msg.data = enabled
+        self.enable_global_planner_pub.publish(msg)
+
     def _send_goal(self, target, waypoints=None):
-        """Send a goal (with optional intermediate waypoints) to the planner.
+        """Send a goal (with optional intermediate waypoints) to the basic waypoint planner.
 
         The ``goal_path`` message is a ``nav_msgs/Path``.  The last pose is
         the goal position; all preceding poses are intermediate waypoints.
@@ -294,11 +333,11 @@ class StateMachineNode(Node):
         return math.sqrt(dx * dx + dy * dy + dz * dz) <= self.goal_tolerance
 
     def _explore_complete(self):
-        if self.target_lantern_count > 0 and len(self.detected_lanterns) >= self.target_lantern_count:
-            self.get_logger().info(
-                f"Lantern target reached: {len(self.detected_lanterns)} / {self.target_lantern_count}"
-            )
-            return True
+        #if self.target_lantern_count > 0 and len(self.detected_lanterns) >= self.target_lantern_count:
+        #    self.get_logger().info(
+        #        f"Lantern target reached: {len(self.detected_lanterns)} / {self.target_lantern_count}"
+        #    )
+        #    return True
 
         if self.explore_start_time is not None:
             elapsed = (self.get_clock().now() - self.explore_start_time).nanoseconds * 1e-9
