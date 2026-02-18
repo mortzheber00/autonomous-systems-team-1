@@ -222,10 +222,7 @@ class StateMachineNode(Node):
             return
 
         if self.state == MissionState.EXPLORE:
-            #self._publish_enable_local_planner(True)
-            #self._publish_enable_rrt(True)
-            if self._explore_complete():  # timout checkk
-                self._transition_to(MissionState.LAND)
+            # wait to receive "DONE" from global planner to transition to LAND
             return
 
         if self.state == MissionState.LAND:
@@ -257,10 +254,10 @@ class StateMachineNode(Node):
             self._cancel_planner()
             self._publish_enable_local_planner(True)
             self._publish_enable_rrt(True)
-            # Delay global planner by 5 seconds
             self._global_planner_delay_timer = self.create_timer(
                 10.0, self._delayed_enable_global_planner
-            )
+            ) # Delay global planner by 5 seconds
+
         elif new_state in (MissionState.TAKEOFF, MissionState.GO_TO_ENTRANCE, MissionState.LAND, MissionState.DONE):
             self._publish_enable_local_planner(False)
             self._publish_enable_rrt(False)
@@ -340,21 +337,6 @@ class StateMachineNode(Node):
         dy = self.current_pose.y - target[1]
         dz = self.current_pose.z - target[2]
         return math.sqrt(dx * dx + dy * dy + dz * dz) <= self.goal_tolerance
-
-    def _explore_complete(self):
-        #if self.target_lantern_count > 0 and len(self.detected_lanterns) >= self.target_lantern_count:
-        #    self.get_logger().info(
-        #        f"Lantern target reached: {len(self.detected_lanterns)} / {self.target_lantern_count}"
-        #    )
-        #    return True
-
-        if self.explore_start_time is not None:
-            elapsed = (self.get_clock().now() - self.explore_start_time).nanoseconds * 1e-9
-            if elapsed >= self.explore_timeout_sec:
-                self.get_logger().warn("Explore timeout reached, initiating landing")
-                return True
-
-        return False
 
     def _save_lantern_positions(self):
         try:
