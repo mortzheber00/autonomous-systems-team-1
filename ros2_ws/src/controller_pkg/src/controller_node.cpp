@@ -101,7 +101,7 @@ public:
     xd(-38,10,9),
     vd(0,0,0),
     ad(0,0,0),
-    yawd(0)
+    yawd(3.14159265)
   {
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     //  PART 2 |  Initialize ROS callback handlers
@@ -170,6 +170,16 @@ public:
       // Store the full path for the control loop to process (Carrot Following)
       path_points_ = msg->points;
       has_trajectory_ = true;
+
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[DBG-TRAJ] Received trajectory: %zu points. First=(%f,%f,%f) Last=(%f,%f,%f)",
+        msg->points.size(),
+        msg->points.front().transforms[0].translation.x,
+        msg->points.front().transforms[0].translation.y,
+        msg->points.front().transforms[0].translation.z,
+        msg->points.back().transforms[0].translation.x,
+        msg->points.back().transforms[0].translation.y,
+        msg->points.back().transforms[0].translation.z);
   }
   
   // Helper: extract position from a trajectory point
@@ -316,6 +326,14 @@ public:
       debug_cross_track_ = cross_track_error;
       debug_path_tangent_ = path_tangent;
 
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[DBG-CARROT] pts=%zu closest=%zu xd=(%f,%f,%f) vd=(%f,%f,%f) "
+        "cross_trk=%.2f lookahead=%.1f dist_end=%.1f des_speed=%.2f tangent=(%f,%f,%f)",
+        path_points_.size(), closest_idx,
+        xd.x(), xd.y(), xd.z(), vd.x(), vd.y(), vd.z(),
+        cross_track_error, lookahead, dist_to_end, desired_speed,
+        path_tangent.x(), path_tangent.y(), path_tangent.z());
+
       // ── 8. Yaw: face direction of travel (path tangent in xy-plane) ──
       if (path_tangent.head<2>().norm() > 0.1) {
           yawd = std::atan2(path_tangent.y(), path_tangent.x());
@@ -352,6 +370,10 @@ public:
                       cur_state_msg->twist.twist.angular.y,
                       cur_state_msg->twist.twist.angular.z;
       omega = R.transpose() * omega_world;
+
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+        "[DBG-ODOM] pos=(%f,%f,%f) vel=(%f,%f,%f) speed=%.2f",
+        x.x(), x.y(), x.z(), v.x(), v.y(), v.z(), v.norm());
   }
 
   void controlLoop(){
@@ -360,6 +382,8 @@ public:
         xd = x;
         vd.setZero();
         ad.setZero();
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+          "[DBG-LOOP] No trajectory yet → hovering at (%f,%f,%f)", x.x(), x.y(), x.z());
     } else {
         updateDesiredStateFromCarrot();
     }
@@ -377,7 +401,7 @@ public:
     // Limit Max Velocity (by saturation of position error)
     // Limits the maximum "pull" towards the goal
     // Steady state velocity v = -(kx/kv) * ex
-    double max_velocity = 8.0; // m/s
+    double max_velocity = 6.0; // m/s
     double max_ex = max_velocity * kv / kx;
     if (ex.norm() > max_ex) {
         ex = ex.normalized() * max_ex;
@@ -463,6 +487,13 @@ public:
     cmd.angular_velocities[2] = w3;
     cmd.angular_velocities[3] = w4;
     rotor_speed_publisher_->publish(cmd);
+
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "[DBG-CTRL] ex=(%.2f,%.2f,%.2f)|%.2f ev=(%.2f,%.2f,%.2f)|%.2f "
+      "f=%.2f rotors=[%.1f,%.1f,%.1f,%.1f] yawd=%.2f",
+      ex.x(), ex.y(), ex.z(), ex.norm(),
+      ev.x(), ev.y(), ev.z(), ev.norm(),
+      f, w1, w2, w3, w4, yawd);
 
     // Publish debug markers at ~20 Hz (every 50th iteration at 1000 Hz)
     debug_publish_counter_++;

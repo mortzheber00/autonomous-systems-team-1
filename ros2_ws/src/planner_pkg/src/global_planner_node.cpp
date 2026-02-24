@@ -76,6 +76,9 @@ struct Junction {
   std::vector<JunctionArm> arms;                   ///< Diverging exploration directions
   rclcpp::Time last_updated;                       ///< Timestamp of last gain re-evaluation
   bool fully_explored = false;                     ///< True when all arms are explored or low-gain
+  size_t creation_breadcrumb_idx = 0;              ///< Breadcrumb index when junction was created;
+                                                   ///  only breadcrumbs AFTER this index are used
+                                                   ///  for arm-explored detection
 
   Junction() : id(0), last_updated(0, 0, RCL_ROS_TIME) {}
 
@@ -304,12 +307,12 @@ private:
     current_position_ = msg->pose.pose.position;
     odom_received_ = true;
 
-    // Record breadcrumbs for backtrack routing
-    if (state_ == ExplorationState::EXPLORING) {
-      if (breadcrumbs_.empty() ||
-          point_distance(current_position_, breadcrumbs_.back()) >= breadcrumb_spacing_) {
-        breadcrumbs_.push_back(current_position_);
-      }
+    // Record breadcrumbs for backtrack routing and arm-explored detection.
+    // Recorded in ALL states so that backtracking flights also leave a trail
+    // (needed to mark junction arms the drone passes through during backtrack).
+    if (breadcrumbs_.empty() ||
+        point_distance(current_position_, breadcrumbs_.back()) >= breadcrumb_spacing_) {
+      breadcrumbs_.push_back(current_position_);
     }
   }
 
@@ -504,6 +507,10 @@ private:
    * Each hop is short enough for the RRT to handle.
    */
   void handle_backtracking() {
+    // Also mark arms during backtracking — the drone may fly through or
+    // past other junctions on its way to the target junction.
+    mark_explored_arms();
+
     if (backtrack_waypoints_.empty() || backtrack_wp_idx_ >= backtrack_waypoints_.size()) {
       // Shouldn't happen, but recover gracefully
       RCLCPP_WARN(get_logger(), "[GLOBAL] Backtrack waypoints exhausted -> EXPLORING");
@@ -771,6 +778,7 @@ private:
     jct.id = junction_counter_++;
     jct.position = match->position;
     jct.last_updated = now_t;
+    jct.creation_breadcrumb_idx = breadcrumbs_.size();  // only future breadcrumbs count
 
     for (size_t ci = 0; ci < match->arm_clusters.size(); ++ci) {
       JunctionArm arm;
@@ -971,22 +979,92 @@ private:
   }
 
   /**
-   * Mark junction arms as explored when the drone flies close to them.
+   * Mark junction arms as explored when the drone flies close to them
+   * OR has traveled along the arm's direction (detected via breadcrumbs).
+   *
+   * Three checks per arm:
+   *   1. Current position near the arm's original target point (legacy check)
+   *   2. Any breadcrumb lies along the arm's direction from the junction centre
+   *      at a sufficient distance → the drone has flown down that corridor
+   *   3. Current position lies along the arm's direction (catches the case
+   *      where the drone returns to a junction from a loop)
    */
   void mark_explored_arms() {
+    // Cone parameters: a point must be within the angular cone AND within
+    // the distance band [min, max] from the junction centre to count.
+    // Beyond max the cave has likely turned and direction is unreliable.
+    const double arm_angle_threshold = M_PI / 7.0;   //
+    const double min_travel_from_jct = 40.0;          // Too close = still at junction
+    const double max_travel_from_jct = 80.0;          // Too far = direction unreliable
+
     for (auto& jct : junctions_) {
       if (jct.fully_explored) continue;
+
+      Eigen::Vector3d jct_pos(jct.position.x, jct.position.y, jct.position.z);
 
       for (auto& arm : jct.arms) {
         if (arm.explored) continue;
 
-        // Arm is explored if drone passed within tolerance of its target
-        double dist = point_distance(current_position_, arm.target);
-        if (dist < goal_reached_tolerance_) {
+        // --- Check 1: proximity to original target (quick, cheap) ---
+        double dist_to_target = point_distance(current_position_, arm.target);
+        if (dist_to_target < goal_reached_tolerance_) {
           arm.explored = true;
           RCLCPP_INFO(get_logger(),
-            "[JUNCTION] Marked arm of junction %d as explored (target dist=%.1fm)",
-            jct.id, dist);
+            "[JUNCTION] Marked arm of junction %d as explored "
+            "(near target, dist=%.1fm)",
+            jct.id, dist_to_target);
+          continue;
+        }
+
+        // --- Check 2: breadcrumbs in the arm's cone ---
+        //     ONLY breadcrumbs recorded AFTER the junction was created.
+        //     Must be within the distance band [min, max] from junction.
+        for (size_t bi = jct.creation_breadcrumb_idx; bi < breadcrumbs_.size(); ++bi) {
+          Eigen::Vector3d crumb_pos(breadcrumbs_[bi].x, breadcrumbs_[bi].y, breadcrumbs_[bi].z);
+          Eigen::Vector3d to_crumb = crumb_pos - jct_pos;
+          double dist_from_jct = to_crumb.norm();
+
+          // Skip if outside the detection band
+          if (dist_from_jct < min_travel_from_jct || dist_from_jct > max_travel_from_jct)
+            continue;
+
+          to_crumb.normalize();
+          double angle = std::acos(
+            std::clamp(to_crumb.dot(arm.direction), -1.0, 1.0));
+
+          if (angle < arm_angle_threshold) {
+            arm.explored = true;
+            RCLCPP_INFO(get_logger(),
+              "[JUNCTION] Marked arm of junction %d as explored "
+              "(breadcrumb in cone, angle=%.1f°, dist=%.1fm from jct)",
+              jct.id, angle * 180.0 / M_PI, dist_from_jct);
+            break;
+          }
+        }
+        if (arm.explored) continue;
+
+        // --- Check 3: current position in the arm's cone ---
+        //     Only after the drone has moved away since junction creation.
+        if (breadcrumbs_.size() <= jct.creation_breadcrumb_idx) continue;
+
+        Eigen::Vector3d cur_pos(current_position_.x,
+                                current_position_.y,
+                                current_position_.z);
+        Eigen::Vector3d to_cur = cur_pos - jct_pos;
+        double dist_cur = to_cur.norm();
+
+        if (dist_cur >= min_travel_from_jct && dist_cur <= max_travel_from_jct) {
+          to_cur.normalize();
+          double angle = std::acos(
+            std::clamp(to_cur.dot(arm.direction), -1.0, 1.0));
+
+          if (angle < arm_angle_threshold) {
+            arm.explored = true;
+            RCLCPP_INFO(get_logger(),
+              "[JUNCTION] Marked arm of junction %d as explored "
+              "(drone in cone, angle=%.1f°, dist=%.1fm from jct)",
+              jct.id, angle * 180.0 / M_PI, dist_cur);
+          }
         }
       }
 
