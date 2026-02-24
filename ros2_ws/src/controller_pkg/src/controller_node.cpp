@@ -442,7 +442,7 @@ public:
 
      if (counter % 500 == 0) {  // bei 1000 Hz => etwa alle 0.5s
          double pos_error = ex.norm();
-         RCLCPP_INFO(this->get_logger(), "Position error: %.3f m", pos_error);
+         //RCLCPP_INFO(this->get_logger(), "Position error: %.3f m", pos_error);
      }
   }
 };

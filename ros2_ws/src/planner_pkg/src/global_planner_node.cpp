@@ -49,6 +49,7 @@
 #include <string>
 #include <queue>
 #include <limits>
+#include <std_msgs/msg/bool.hpp>
 
 // ============================================================================
 // Data Structures
@@ -185,6 +186,12 @@ public:
       "/rrt_status", 10,
       std::bind(&GlobalPlannerNode::rrt_status_callback, this, std::placeholders::_1));
 
+    // Added this for: Enable/Disable Local Planner for state machine control
+    enable_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/state_machine/enable_global_planner", 1,
+      std::bind(&GlobalPlannerNode::enable_callback, this, std::placeholders::_1)
+    );
+
     // ---- Timers ----
     planning_timer_ = create_wall_timer(
       std::chrono::milliseconds(1000),
@@ -208,7 +215,11 @@ private:
   ExplorationState state_ = ExplorationState::EXPLORING;
   geometry_msgs::msg::Point current_position_;
   geometry_msgs::msg::Point home_position_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_subscription_;
   bool odom_received_ = false;
+
+  // State Machine for Goal Persistence
+  bool global_planner_enabled_ = false;
 
   // Junction management
   std::vector<Junction> junctions_;
@@ -283,6 +294,11 @@ private:
   // ==========================================================================
   // Callbacks
   // ==========================================================================
+
+  void enable_callback(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    global_planner_enabled_ = msg->data;
+  }
 
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     current_position_ = msg->pose.pose.position;
@@ -368,6 +384,11 @@ private:
 
   void planning_loop() {
     if (!odom_received_) return;
+
+    // enable by state-machine
+    if (!global_planner_enabled_) {
+        return;
+    }
 
     // Publish current state for monitoring
     std_msgs::msg::String state_msg;

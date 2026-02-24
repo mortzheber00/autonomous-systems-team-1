@@ -15,6 +15,7 @@
 #include <octomap_msgs/conversions.h>
 #include "TreeNode.h"
 #include <std_msgs/msg/string.hpp>
+#include <std_msgs/msg/bool.hpp>
 #include <memory>
 #include <thread>
 #include <mutex>
@@ -91,6 +92,12 @@ public:
       std::bind(&RRT3DNode::global_goal_callback, this, std::placeholders::_1)
     );
     
+    // Enable/Disable RRT from state machine
+    enable_subscription_ = create_subscription<std_msgs::msg::Bool>(
+      "/state_machine/enable_rrt", 1,
+      std::bind(&RRT3DNode::enable_callback, this, std::placeholders::_1)
+    );
+
     // Publisher for RRT status ("idle" / "active")
     rrt_status_publisher_ = create_publisher<std_msgs::msg::String>("/rrt_status", 10);
     
@@ -149,7 +156,9 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_subscriber;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_subscription_;
   rclcpp::Publisher<std_msgs::msg::String>::SharedPtr rrt_status_publisher_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr enable_subscription_;
   rclcpp::TimerBase::SharedPtr trajectory_timer_;
+  bool rrt_enabled_ = false;
   bool has_global_goal_ = false;  // True when pursuing a global planner goal (higher priority)
 
   /**
@@ -215,8 +224,14 @@ private:
    * Tries each frontier in order until a valid path is found.
    * Skipped when a global goal is being pursued.
    */
+  void enable_callback(const std_msgs::msg::Bool::SharedPtr msg)
+  {
+    rrt_enabled_ = msg->data;
+  }
+
   void frontier_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg)
   {
+    if (!rrt_enabled_) return;
     if (msg->poses.empty()) {
       RCLCPP_WARN(get_logger(), "Received empty frontier list");
       return;
@@ -444,6 +459,7 @@ private:
    */
   void trajectory_publishing_loop()
   {
+    if (!rrt_enabled_) return;
     std::lock_guard<std::mutex> lock(planning_mutex_);
     
     // Publish RRT status

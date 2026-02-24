@@ -51,7 +51,13 @@ ament_target_dependencies(local_planner_node
   tf2_geometry_msgs
   visualization_msgs
   trajectory_msgs
+  std_msgs
   Eigen3
+)
+
+target_link_libraries(local_planner_node
+  octomap
+  octomath
 )
 
 # Add global planner node executable
@@ -70,6 +76,11 @@ ament_target_dependencies(global_planner_node
   visualization_msgs
   std_msgs
   Eigen3
+)
+
+target_link_libraries(global_planner_node
+  octomap
+  octomath
 )
 
 # Install executables
