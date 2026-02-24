@@ -10,6 +10,7 @@
 #include <mav_msgs/msg/actuators.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
+#include <visualization_msgs/msg/marker.hpp>
 
 #include <Eigen/Dense>
 #include <tf2/utils.h>
@@ -27,6 +28,9 @@ class ControllerNode : public rclcpp::Node {
 
   // Publisher (propeller speeds)
   rclcpp::Publisher<mav_msgs::msg::Actuators>::SharedPtr rotor_speed_publisher_;
+
+  // Publisher for target point visualization
+  rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr target_marker_publisher_;
 
   // Timer for main control loop
   rclcpp::TimerBase::SharedPtr control_loop_timer_;
@@ -62,8 +66,9 @@ class ControllerNode : public rclcpp::Node {
   Eigen::Vector3d ad;    // desired acceleration of the UAV's c.o.m. in the world frame
   double yawd;           // desired yaw angle
   
-  // Storage for the full trajectory path (Carrot Following)
+  // Storage for the full trajectory path (Time-based trajectory following)
   std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> path_points_;
+  rclcpp::Time trajectory_start_time_;  // Timestamp when current trajectory was received
 
   double hz;             // frequency of the main control loop
 
@@ -87,7 +92,7 @@ public:
     xd(-38,10,9),
     vd(0,0,0),
     ad(0,0,0),
-    yawd(0)
+    yawd(3.1415926)
   {
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     //  PART 2 |  Initialize ROS callback handlers
@@ -106,6 +111,10 @@ public:
     // Publisher for Motor Commands
     rotor_speed_publisher_ = this->create_publisher<mav_msgs::msg::Actuators>(
         "/rotor_speed_cmds", 10);
+
+    // Publisher for target point visualization
+    target_marker_publisher_ = this->create_publisher<visualization_msgs::msg::Marker>(
+        "/target_point", 10);
 
     // bind controllerNode::controlLoop() to the created timer, at frequency
     control_loop_timer_ = this->create_wall_timer(
@@ -149,73 +158,124 @@ public:
         return;
       }
 
-      // Store the full path for the control loop to process (Carrot Following)
-      path_points_ = msg->points;
+            // If message contains only a single point that's almost exactly
+            // the current drone position, ignore it so we keep following the
+            // previously received trajectory. This avoids overwriting the
+            // path with a trivial start-point when planning fails.
+            bool accept_new = true;
+            if (msg->points.size() == 1 && !path_points_.empty()) {
+                const auto &p0 = msg->points[0];
+                if (!p0.transforms.empty()) {
+                    double px = p0.transforms[0].translation.x;
+                    double py = p0.transforms[0].translation.y;
+                    double pz = p0.transforms[0].translation.z;
+                    double dx = px - x.x();
+                    double dy = py - x.y();
+                    double dz = pz - x.z();
+                    double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
+                    if (dist < 0.2) {
+                        RCLCPP_INFO(this->get_logger(), "Ignoring trivial single-point trajectory (dist=%.3f)", dist);
+                        accept_new = false;
+                    }
+                }
+            }
+
+            if (accept_new) {
+                // Store the full path and record when trajectory was received
+                path_points_ = msg->points;
+                trajectory_start_time_ = this->get_clock()->now();
+            }
   }
   
-  void updateDesiredStateFromCarrot() {
+  void updateDesiredStateFromTime() {
       if (path_points_.empty()) return;
 
-      // 1. Find closest point on path to current drone position 'x'
-      double min_dist_sq = std::numeric_limits<double>::max();
-      size_t closest_idx = 0;
-      
-      // Optimization: If path is long, we could search only a window, but full search is safest
-      for (size_t i = 0; i < path_points_.size(); ++i) {
-          const auto& p = path_points_[i];
-          double dx = p.transforms[0].translation.x - x.x();
-          double dy = p.transforms[0].translation.y - x.y();
-          double dz = p.transforms[0].translation.z - x.z();
-          double d_sq = dx*dx + dy*dy + dz*dz;
-           if (d_sq < min_dist_sq) {
-               min_dist_sq = d_sq;
-               closest_idx = i;
-           }
-      }
+      // Calculate elapsed time since trajectory was received
+      double elapsed_time = (this->get_clock()->now() - trajectory_start_time_).seconds();
 
-      // 2. Look ahead 5m (or end of path)
-      size_t target_idx = closest_idx;
-      double lookahead = 5.0; 
-      
-      for (size_t i = closest_idx; i < path_points_.size(); ++i) {
+      // Start search at index 1 if available to ignore the initial 'current position' waypoint
+      size_t start_idx = (path_points_.size() > 1) ? 1 : 0;
+
+      // Find trajectory point that matches current elapsed time
+      // Strategy: Find first point where time_from_start >= elapsed_time, starting at start_idx
+      size_t target_idx = start_idx;
+      for (size_t i = start_idx; i < path_points_.size(); ++i) {
           const auto& p = path_points_[i];
-          double dx = p.transforms[0].translation.x - x.x();
-          double dy = p.transforms[0].translation.y - x.y();
-          double dz = p.transforms[0].translation.z - x.z();
-          double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-          
-          target_idx = i;
-          if (dist >= lookahead) {
+          double point_time = p.time_from_start.sec + p.time_from_start.nanosec / 1e9;
+
+          if (point_time >= elapsed_time) {
+              target_idx = i;
               break;
           }
       }
-      
+
+      // If no point matched the elapsed_time, use the last point
+      target_idx = std::min(target_idx, path_points_.size() - 1);
+
+      // If the chosen target is still too close to the drone (e.g. first point equals drone position),
+      // advance to the next waypoint so the controller doesn't 'stick' to the drone's current pose.
+      const auto& tentative = path_points_[target_idx];
+      double ignore_first_threshold = 0.5; // meters
+      if (!tentative.transforms.empty()) {
+          double tx = tentative.transforms[0].translation.x;
+          double ty = tentative.transforms[0].translation.y;
+          double tz = tentative.transforms[0].translation.z;
+          double dx_now = tx - x.x();
+          double dy_now = ty - x.y();
+          double dz_now = tz - x.z();
+          double dist_now = std::sqrt(dx_now*dx_now + dy_now*dy_now + dz_now*dz_now);
+
+          if (dist_now < ignore_first_threshold && target_idx + 1 < path_points_.size()) {
+              target_idx = target_idx + 1;
+          }
+      }
+
       const auto& target = path_points_[target_idx];
 
-      // 3. Update Desired State
+      // Update Desired State from target trajectory point
       if (!target.transforms.empty()) {
             xd << target.transforms[0].translation.x,
                     target.transforms[0].translation.y,
                     target.transforms[0].translation.z;
-            
-            // Extract yaw
+
+            // Extract yaw from quaternion
             auto q = target.transforms[0].rotation;
             double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
             double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
             yawd = std::atan2(siny_cosp, cosy_cosp);
       }
 
-      if (!target.velocities.empty()) {
-            vd << target.velocities[0].linear.x,
-                    target.velocities[0].linear.y,
-                    target.velocities[0].linear.z;
+      // Calculate desired velocity from consecutive trajectory points
+      if (target_idx + 1 < path_points_.size()) {
+          const auto& next_target = path_points_[target_idx + 1];
+
+          if (!target.transforms.empty() && !next_target.transforms.empty()) {
+              // Get position difference
+              double dx = next_target.transforms[0].translation.x - target.transforms[0].translation.x;
+              double dy = next_target.transforms[0].translation.y - target.transforms[0].translation.y;
+              double dz = next_target.transforms[0].translation.z - target.transforms[0].translation.z;
+
+              // Get time difference
+              double curr_time = target.time_from_start.sec + target.time_from_start.nanosec / 1e9;
+              double next_time = next_target.time_from_start.sec + next_target.time_from_start.nanosec / 1e9;
+              double dt = next_time - curr_time;
+
+              // Calculate desired velocity (position delta / time delta)
+              if (dt > 1e-6) {
+                  vd << dx / dt, dy / dt, dz / dt;
+              } else {
+                  vd.setZero();
+              }
+          } else {
+              vd.setZero();
+          }
+      } else {
+          // Last point: no more movement desired
+          vd.setZero();
       }
 
-      if (!target.accelerations.empty()) {
-            ad << target.accelerations[0].linear.x,
-                    target.accelerations[0].linear.y,
-                    target.accelerations[0].linear.z;
-      }
+      // No acceleration data from trajectory (all zeros anyway)
+      ad.setZero();
   }
 
 
@@ -250,7 +310,7 @@ public:
   }
 
   void controlLoop(){
-    updateDesiredStateFromCarrot();
+    updateDesiredStateFromTime();
 
     Eigen::Vector3d ex, ev, er, eomega;
 
@@ -351,6 +411,31 @@ public:
     cmd.angular_velocities[2] = w3;
     cmd.angular_velocities[3] = w4;
     rotor_speed_publisher_->publish(cmd);
+
+    // 5.7 Publish target point marker for visualization
+    visualization_msgs::msg::Marker target_marker;
+    target_marker.header.frame_id = "world";
+    target_marker.header.stamp = this->get_clock()->now();
+    target_marker.id = 0;
+    target_marker.type = visualization_msgs::msg::Marker::SPHERE;
+    target_marker.action = visualization_msgs::msg::Marker::ADD;
+    
+    target_marker.pose.position.x = xd.x();
+    target_marker.pose.position.y = xd.y();
+    target_marker.pose.position.z = xd.z();
+    target_marker.pose.orientation.w = 1.0;
+    
+    target_marker.scale.x = 1.0;
+    target_marker.scale.y = 1.0;
+    target_marker.scale.z = 1.0;
+    
+    // Cyan color with some transparency
+    target_marker.color.r = 0.0f;
+    target_marker.color.g = 1.0f;
+    target_marker.color.b = 1.0f;
+    target_marker.color.a = 0.8f;
+    
+    target_marker_publisher_->publish(target_marker);
 
      static int counter = 0;
      counter++;
