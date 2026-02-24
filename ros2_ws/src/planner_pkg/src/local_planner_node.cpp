@@ -99,7 +99,7 @@ private:
   std::vector<tf2::Vector3> movement_history_; 
 
   // State Machine for Goal Persistence
-  bool local_planner_enabled_ = true;
+  bool local_planner_enabled_ = false;
 
   // Configuration
   const float exploration_radius_ = 10.0;    // Radius around frontier to calculate gain
