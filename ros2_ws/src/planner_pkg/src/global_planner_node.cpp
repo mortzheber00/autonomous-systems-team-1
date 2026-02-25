@@ -151,6 +151,7 @@ public:
     declare_parameter("candidate_merge_radius_m",    30.0);
     declare_parameter("breadcrumb_spacing_m",        30.0);
     declare_parameter("wall_clearance_m",             3.0);
+    declare_parameter("planning_loop_hz",              2.0);
     home_position_.x = get_parameter("home_x").as_double();
     home_position_.y = get_parameter("home_y").as_double();
     home_position_.z = get_parameter("home_z").as_double();
@@ -166,6 +167,7 @@ public:
     candidate_merge_radius_      = get_parameter("candidate_merge_radius_m").as_double();
     breadcrumb_spacing_          = get_parameter("breadcrumb_spacing_m").as_double();
     wall_clearance_              = get_parameter("wall_clearance_m").as_double();
+    planning_loop_hz_            = std::max(0.1, get_parameter("planning_loop_hz").as_double());
 
     // ---- Publishers ----
     global_goal_pub_    = create_publisher<geometry_msgs::msg::PoseArray>("/global_goal", 10);
@@ -196,8 +198,9 @@ public:
     );
 
     // ---- Timers ----
+    const auto planning_period = std::chrono::duration<double>(1.0 / planning_loop_hz_);
     planning_timer_ = create_wall_timer(
-      std::chrono::milliseconds(1000),
+      planning_period,
       std::bind(&GlobalPlannerNode::planning_loop, this));
 
     viz_timer_ = create_wall_timer(
@@ -208,9 +211,9 @@ public:
 
     RCLCPP_INFO(get_logger(),
       "Global Planner initialized. Home=(%.0f, %.0f, %.0f), "
-      "junction_angle=%.0f deg, timeout=%.0fs",
+      "junction_angle=%.0f deg, timeout=%.0fs, planning_loop=%.1f Hz",
       home_position_.x, home_position_.y, home_position_.z,
-      junction_angle_threshold_ * 180.0 / M_PI, no_frontier_timeout_);
+      junction_angle_threshold_ * 180.0 / M_PI, no_frontier_timeout_, planning_loop_hz_);
   }
 
 private:
@@ -280,6 +283,7 @@ private:
   double min_frontier_gain_for_timer_;  ///< Only frontiers with gain above this reset the timer
   double candidate_merge_radius_;       ///< Radius for merging junction candidate detections
   double wall_clearance_;                ///< Min distance a backtrack target must be from walls
+  double planning_loop_hz_ = 2.0;        ///< Frequency of planning loop updates
 
   // ---- ROS handles ----
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr global_goal_pub_;

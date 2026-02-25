@@ -34,7 +34,11 @@ def generate_launch_description():
         executable="trajectory_sampler_node",
         name="sampler",
         output="screen",
-        parameters=[{"use_sim_time": False}],
+        parameters=[{
+            "use_sim_time": False,
+            "publish_whole_trajectory": True,
+            "dt": 0.05,  # 20 Hz sampling → dense path for carrot following
+        }],
         remappings=[
             ("path_segments_4D", "trajectory"),  # Planner publishes to "trajectory"
         ],
