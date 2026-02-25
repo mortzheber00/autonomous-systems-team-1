@@ -152,6 +152,8 @@ public:
     declare_parameter("breadcrumb_spacing_m",        30.0);
     declare_parameter("wall_clearance_m",             3.0);
     declare_parameter("planning_loop_hz",              2.0);
+    declare_parameter("idle_timeout_sec",             15.0);
+    declare_parameter("idle_movement_radius_m",        2.0);
     home_position_.x = get_parameter("home_x").as_double();
     home_position_.y = get_parameter("home_y").as_double();
     home_position_.z = get_parameter("home_z").as_double();
@@ -168,6 +170,8 @@ public:
     breadcrumb_spacing_          = get_parameter("breadcrumb_spacing_m").as_double();
     wall_clearance_              = get_parameter("wall_clearance_m").as_double();
     planning_loop_hz_            = std::max(0.1, get_parameter("planning_loop_hz").as_double());
+    idle_timeout_sec_            = get_parameter("idle_timeout_sec").as_double();
+    idle_movement_radius_        = get_parameter("idle_movement_radius_m").as_double();
 
     // ---- Publishers ----
     global_goal_pub_    = create_publisher<geometry_msgs::msg::PoseArray>("/global_goal", 10);
@@ -284,6 +288,11 @@ private:
   double candidate_merge_radius_;       ///< Radius for merging junction candidate detections
   double wall_clearance_;                ///< Min distance a backtrack target must be from walls
   double planning_loop_hz_ = 2.0;        ///< Frequency of planning loop updates
+  double idle_timeout_sec_ = 15.0;       ///< Seconds of no motion before forcing return home
+  double idle_movement_radius_ = 2.0;    ///< Distance that counts as motion progress
+  geometry_msgs::msg::Point last_movement_position_{};
+  rclcpp::Time last_movement_time_;
+  bool movement_tracking_initialized_ = false;
 
   // ---- ROS handles ----
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr global_goal_pub_;
@@ -310,6 +319,16 @@ private:
   void odom_callback(const nav_msgs::msg::Odometry::SharedPtr msg) {
     current_position_ = msg->pose.pose.position;
     odom_received_ = true;
+
+    const auto now_t = now();
+    if (!movement_tracking_initialized_) {
+      last_movement_position_ = current_position_;
+      last_movement_time_ = now_t;
+      movement_tracking_initialized_ = true;
+    } else if (point_distance(current_position_, last_movement_position_) >= idle_movement_radius_) {
+      last_movement_position_ = current_position_;
+      last_movement_time_ = now_t;
+    }
 
     // Record breadcrumbs for backtrack routing and arm-explored detection.
     // Recorded in ALL states so that backtracking flights also leave a trail
@@ -416,6 +435,8 @@ private:
         break;
     }
 
+    check_idle_timeout();
+
     // Periodically re-evaluate junction gains
     re_evaluate_junction_gains();
   }
@@ -493,15 +514,7 @@ private:
         }
       } else {
         // No junctions left -> go home via breadcrumb route
-        backtrack_waypoints_ = build_backtrack_route(home_position_);
-        backtrack_waypoints_.push_back(home_position_);
-        backtrack_wp_idx_ = 0;
-        state_ = ExplorationState::RETURNING_HOME;
-        RCLCPP_WARN(get_logger(),
-          "[GLOBAL] -> RETURNING_HOME via %zu waypoints", backtrack_waypoints_.size());
-        if (!backtrack_waypoints_.empty()) {
-          publish_global_goal(backtrack_waypoints_[0]);
-        }
+        initiate_return_home("no junctions remaining");
       }
     }
   }
@@ -603,6 +616,37 @@ private:
       }
     } else {
       publish_global_goal(current_wp);
+    }
+  }
+
+  void initiate_return_home(const std::string& reason) {
+    backtrack_waypoints_ = build_backtrack_route(home_position_);
+    backtrack_waypoints_.push_back(home_position_);
+    backtrack_wp_idx_ = 0;
+    state_ = ExplorationState::RETURNING_HOME;
+    RCLCPP_WARN(get_logger(),
+      "[GLOBAL] -> RETURNING_HOME (%s) via %zu waypoints",
+      reason.c_str(), backtrack_waypoints_.size());
+
+    if (!backtrack_waypoints_.empty()) {
+      publish_global_goal(backtrack_waypoints_[0]);
+    } else {
+      publish_global_goal(home_position_);
+    }
+  }
+
+  void check_idle_timeout() {
+    if (!global_planner_enabled_) return;
+    if (state_ == ExplorationState::RETURNING_HOME || state_ == ExplorationState::DONE) return;
+    if (!movement_tracking_initialized_) return;
+
+    double idle_elapsed = (now() - last_movement_time_).seconds();
+    if (idle_elapsed > idle_timeout_sec_) {
+      RCLCPP_WARN(get_logger(),
+        "[GLOBAL] No motion > %.1fs within %.1fm — forcing return home",
+        idle_elapsed, idle_movement_radius_);
+      initiate_return_home("motion timeout");
+      progress_time_initialized_ = false;
     }
   }
 

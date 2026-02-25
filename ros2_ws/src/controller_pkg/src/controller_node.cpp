@@ -84,7 +84,7 @@ class ControllerNode : public rclcpp::Node {
     // Mission-state driven behavior switches
     std::string mission_state_ = "idle";
     bool cross_track_enabled_ = true;
-    const double nominal_speed_cap_mps_ = 10.0;
+    const double nominal_speed_cap_mps_ = 8.0;
     const double takeoff_speed_cap_mps_ = 15.0;
     const double go_to_entrance_wp_radius_ = 10.0;
     double speed_cap_mps_ = 7.0;
