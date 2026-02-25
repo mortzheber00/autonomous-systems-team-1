@@ -9,6 +9,7 @@
 
 #include <mav_msgs/msg/actuators.hpp>
 #include <nav_msgs/msg/odometry.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
@@ -26,6 +27,7 @@ class ControllerNode : public rclcpp::Node {
   // Subscribers
   rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr desired_state_subscriber_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr current_state_subscriber_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mission_state_subscriber_;
 
   // Publisher (propeller speeds)
   rclcpp::Publisher<mav_msgs::msg::Actuators>::SharedPtr rotor_speed_publisher_;
@@ -71,6 +73,16 @@ class ControllerNode : public rclcpp::Node {
   std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> path_points_;
   bool has_trajectory_ = false;  // true once first trajectory is received
 
+  // Mission state received from the state machine node.
+  // "explore" → carrot / pure-pursuit following
+  // everything else ("idle","takeoff","go_to_entrance","land","done") → sequential trajectory following
+  std::string mission_state_ = "idle";
+
+  // Sequential trajectory following state
+  size_t traj_follow_idx_ = 0;          // index of current target waypoint
+  double traj_wp_tolerance_ = 1.5;      // metres – advance to next waypoint
+  double traj_final_tolerance_ = 0.8;   // metres – stop at final waypoint
+
   // Debug state (updated by updateDesiredStateFromCarrot, published in controlLoop)
   double debug_lookahead_ = 0.0;
   double debug_desired_speed_ = 0.0;
@@ -101,7 +113,7 @@ public:
     xd(-38,10,9),
     vd(0,0,0),
     ad(0,0,0),
-    yawd(3.14159265)
+    yawd(-3.14159265)
   {
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     //  PART 2 |  Initialize ROS callback handlers
@@ -125,6 +137,12 @@ public:
     debug_marker_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
         "/controller_debug", 10);
 
+    // Subscribe to mission state from state machine (transient-local to get latched value)
+    auto mode_qos = rclcpp::QoS(1).transient_local();
+    mission_state_subscriber_ = this->create_subscription<std_msgs::msg::String>(
+        "/state_machine/state", mode_qos,
+        std::bind(&ControllerNode::onMissionState, this, std::placeholders::_1));
+
     // bind controllerNode::controlLoop() to the created timer, at frequency
     control_loop_timer_ = this->create_wall_timer(
         std::chrono::duration<double>(1.0 / hz),
@@ -139,7 +157,7 @@ public:
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Controller gains 
     kx = 3.0;
-    kv = 3.6; 
+    kv = 3.7; 
     kr = 10.0;
     komega = 2.0;
 
@@ -167,9 +185,15 @@ public:
         return;
       }
 
-      // Store the full path for the control loop to process (Carrot Following)
+      // Store the full path for the control loop to process
       path_points_ = msg->points;
       has_trajectory_ = true;
+
+      // In trajectory-following mode, reset index so we start from
+      // the beginning of each new trajectory.
+      if (mission_state_ != "explore") {
+          traj_follow_idx_ = 0;
+      }
 
       RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
         "[DBG-TRAJ] Received trajectory: %zu points. First=(%f,%f,%f) Last=(%f,%f,%f)",
@@ -180,6 +204,18 @@ public:
         msg->points.back().transforms[0].translation.x,
         msg->points.back().transforms[0].translation.y,
         msg->points.back().transforms[0].translation.z);
+  }
+
+  void onMissionState(const std_msgs::msg::String::SharedPtr msg) {
+      if (msg->data == mission_state_) return;
+      RCLCPP_INFO(this->get_logger(),
+          "[CTRL-MODE] Mission state changed: %s -> %s",
+          mission_state_.c_str(), msg->data.c_str());
+      mission_state_ = msg->data;
+
+      // Reset trajectory-following index when switching modes so we
+      // don't skip waypoints on the next trajectory in this mode.
+      traj_follow_idx_ = 0;
   }
   
   // Helper: extract position from a trajectory point
@@ -199,6 +235,79 @@ public:
       if (len_sq < 1e-12) return (p - a).norm();
       double t = std::clamp((p - a).dot(ab) / len_sq, 0.0, 1.0);
       return (p - (a + t * ab)).norm();
+  }
+
+  void updateDesiredStateFromTrajectory() {
+      // ── Sequential trajectory following ──
+      // The trajectory sampler publishes densely-sampled points with
+      // position + velocity + acceleration.  We simply pick the point
+      // that is closest-ahead on the trajectory and feed its full
+      // state (pos, vel, acc) to the geometric controller.
+
+      if (path_points_.empty()) return;
+
+      // Clamp index
+      if (traj_follow_idx_ >= path_points_.size())
+          traj_follow_idx_ = path_points_.size() - 1;
+
+      // Advance index while we are within tolerance of the current target
+      while (traj_follow_idx_ + 1 < path_points_.size()) {
+          Eigen::Vector3d wp = pointPosition(path_points_[traj_follow_idx_]);
+          double dist = (wp - x).norm();
+          if (dist > traj_wp_tolerance_) break;
+          traj_follow_idx_++;
+      }
+
+      const auto& pt = path_points_[traj_follow_idx_];
+
+      // Position
+      xd = pointPosition(pt);
+
+      // Velocity (if available in the trajectory point)
+      if (!pt.velocities.empty()) {
+          vd << pt.velocities[0].linear.x,
+                pt.velocities[0].linear.y,
+                pt.velocities[0].linear.z;
+      } else {
+          vd.setZero();
+      }
+
+      // Acceleration (if available)
+      if (!pt.accelerations.empty()) {
+          ad << pt.accelerations[0].linear.x,
+                pt.accelerations[0].linear.y,
+                pt.accelerations[0].linear.z;
+      } else {
+          ad.setZero();
+      }
+
+      // Yaw: use the rotation from the trajectory if available,
+      // otherwise face direction of travel
+      if (!pt.transforms.empty()) {
+          auto& q = pt.transforms[0].rotation;
+          // Extract yaw from quaternion
+          double siny = 2.0 * (q.w * q.z + q.x * q.y);
+          double cosy = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
+          yawd = std::atan2(siny, cosy);
+      }
+
+      // Update debug state for markers
+      debug_lookahead_ = 0.0;
+      debug_desired_speed_ = vd.norm();
+      debug_dist_to_end_ = 0.0;
+      for (size_t i = traj_follow_idx_; i + 1 < path_points_.size(); ++i) {
+          debug_dist_to_end_ += (pointPosition(path_points_[i + 1])
+                                - pointPosition(path_points_[i])).norm();
+      }
+      debug_cross_track_ = (xd - x).norm();
+      debug_path_tangent_ = vd.norm() > 0.01 ? vd.normalized() : Eigen::Vector3d::Zero();
+
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "[DBG-TRAJ-FOLLOW] idx=%zu/%zu xd=(%f,%f,%f) vd=(%f,%f,%f) "
+          "dist_to_wp=%.2f dist_end=%.1f yawd=%.2f",
+          traj_follow_idx_, path_points_.size(),
+          xd.x(), xd.y(), xd.z(), vd.x(), vd.y(), vd.z(),
+          (xd - x).norm(), debug_dist_to_end_, yawd);
   }
 
   void updateDesiredStateFromCarrot() {
@@ -301,12 +410,12 @@ public:
       // Cross-track speed reduction: if drone is far from path, slow down
       // Uses proper segment distance so this only triggers when truly off-path
       if (cross_track_error > 2.0) {
-          double cross_factor = 2.0 / cross_track_error;  // e.g. 4m off → 50% speed
+          double cross_factor = 1.0 / cross_track_error;  // e.g. 4m off → 50% speed
           desired_speed *= cross_factor;
       }
 
       // If remaining path is very short, just hover (prevents drifting into wall)
-      if (dist_to_end < 2.0) {
+      if (dist_to_end < 3.0) {
           desired_speed = 0.0;
       }
 
@@ -378,16 +487,11 @@ public:
 
   void controlLoop(){
     // Before first trajectory: hover at current position
-    if (!has_trajectory_) {
-        xd = x;
-        vd.setZero();
-        ad.setZero();
-        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
-          "[DBG-LOOP] No trajectory yet → hovering at (%f,%f,%f)", x.x(), x.y(), x.z());
+    if (mission_state_ == "takeoff" || mission_state_ == "go_to_entrance") {
+        updateDesiredStateFromTrajectory();
     } else {
         updateDesiredStateFromCarrot();
     }
-
     Eigen::Vector3d ex, ev, er, eomega;
 
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~

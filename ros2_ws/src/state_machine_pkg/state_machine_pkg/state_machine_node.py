@@ -97,6 +97,14 @@ class StateMachineNode(Node):
             enable_qos,
         )
 
+        # Publish the current mission state so other nodes (e.g. controller)
+        # can adapt their behaviour.
+        self.mission_state_pub = self.create_publisher(
+            String,
+            "/state_machine/state",
+            enable_qos,
+        )
+
         self.odom_sub = self.create_subscription(
             Odometry,
             "/current_state_est",
@@ -129,6 +137,7 @@ class StateMachineNode(Node):
         self._publish_enable_local_planner(False)
         self._publish_enable_rrt(False)
         self._publish_enable_global_planner(False)
+        self._publish_state()
 
     def _get_vec_param(self, name: str, optional: bool = False):
         try:
@@ -247,6 +256,7 @@ class StateMachineNode(Node):
         self.get_logger().info(f"[state-machine] Transition: {self.state.value} -> {new_state.value}")
         self.state = new_state
         self.goal_sent = False
+        self._publish_state()
 
         if new_state == MissionState.EXPLORE:
             self.explore_start_time = self.get_clock().now()
@@ -256,7 +266,7 @@ class StateMachineNode(Node):
             self._publish_enable_rrt(True)
             self._global_planner_delay_timer = self.create_timer(
                 10.0, self._delayed_enable_global_planner
-            ) # Delay global planner by 5 seconds
+            ) # Delay global planner by 10 seconds
 
         elif new_state in (MissionState.TAKEOFF, MissionState.GO_TO_ENTRANCE, MissionState.LAND, MissionState.DONE):
             self._publish_enable_local_planner(False)
@@ -272,6 +282,12 @@ class StateMachineNode(Node):
             self._publish_enable_global_planner(True)
             self.get_logger().info("[state-machine] Global planner enabled (5 s delay)")
         self._global_planner_delay_timer.cancel()
+
+    def _publish_state(self):
+        msg = String()
+        msg.data = self.state.value
+        self.mission_state_pub.publish(msg)
+        self.get_logger().info(f"[state-machine] State published: {self.state.value}")
 
     def _publish_enable_local_planner(self, enabled: bool):
         msg = Bool()
