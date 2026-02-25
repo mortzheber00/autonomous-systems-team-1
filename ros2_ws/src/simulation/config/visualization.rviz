@@ -162,9 +162,6 @@ Visualization Manager:
       Name: MarkerArray
       Namespaces:
         home: true
-        junction_arms: true
-        junction_labels: true
-        junctions: true
         state: true
       Topic:
         Depth: 5
@@ -177,7 +174,7 @@ Visualization Manager:
       Enabled: true
       Name: MarkerArray
       Namespaces:
-        lanterns: true
+        {}
       Topic:
         Depth: 5
         Durability Policy: Volatile
@@ -264,7 +261,7 @@ Visualization Manager:
   Views:
     Current:
       Class: rviz_default_plugins/Orbit
-      Distance: 0.0370481014251709
+      Distance: 88.12403106689453
       Enable Stereo Rendering:
         Stereo Eye Separation: 0.05999999865889549
         Stereo Focal Distance: 1
@@ -279,10 +276,10 @@ Visualization Manager:
       Invert Z Axis: false
       Name: Current View
       Near Clip Distance: 0.009999999776482582
-      Pitch: 0.10539911687374115
+      Pitch: 0.015397860668599606
       Target Frame: true_body
       Value: Orbit (rviz)
-      Yaw: 1.7740027904510498
+      Yaw: 0.03583984822034836
     Saved: ~
 Window Geometry:
   Displays:
