@@ -31,8 +31,6 @@
 #include <geometry_msgs/msg/point.hpp>
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <nav_msgs/msg/odometry.hpp>
-#include <nav_msgs/msg/path.hpp>
-#include <geometry_msgs/msg/pose_stamped.hpp>
 #include <visualization_msgs/msg/marker.hpp>
 #include <visualization_msgs/msg/marker_array.hpp>
 #include <std_msgs/msg/string.hpp>
@@ -141,15 +139,15 @@ public:
     declare_parameter("home_z",   16.0);
     declare_parameter("junction_detect_angle_deg", 60.0);
     declare_parameter("junction_proximity_m",      60.0);
-    declare_parameter("no_frontier_timeout_sec",   12.0);
+    declare_parameter("no_frontier_timeout_sec",   5.0);
     declare_parameter("min_gain_threshold",         0.1);
     declare_parameter("goal_reached_tolerance_m",   8.0);
     declare_parameter("exploration_eval_radius_m", 20.0);
     declare_parameter("stagnation_timeout_sec",    20.0);
-    declare_parameter("junction_confirm_count",       0);
+    declare_parameter("junction_confirm_count",       3);
     declare_parameter("min_frontier_gain_for_timer",  0.3);    
     declare_parameter("candidate_merge_radius_m",    30.0);
-    declare_parameter("breadcrumb_spacing_m",        30.0);
+    declare_parameter("breadcrumb_spacing_m",        10.0);
     declare_parameter("wall_clearance_m",             3.0);
     home_position_.x = get_parameter("home_x").as_double();
     home_position_.y = get_parameter("home_y").as_double();
@@ -185,11 +183,7 @@ public:
       "/current_state_est", 10,
       std::bind(&GlobalPlannerNode::odom_callback, this, std::placeholders::_1));
 
-    rrt_status_sub_ = create_subscription<std_msgs::msg::String>(
-      "/rrt_status", 10,
-      std::bind(&GlobalPlannerNode::rrt_status_callback, this, std::placeholders::_1));
-
-    // Added this for: Enable/Disable Local Planner for state machine control
+    // Enable/Disable global planner from state machine
     enable_subscription_ = create_subscription<std_msgs::msg::Bool>(
       "/state_machine/enable_global_planner", 1,
       std::bind(&GlobalPlannerNode::enable_callback, this, std::placeholders::_1)
@@ -230,18 +224,14 @@ private:
 
   // Frontier tracking
   rclcpp::Time last_frontier_time_;
-  std::vector<geometry_msgs::msg::Point> latest_frontiers_;
 
-  // RRT feedback
-  std::string rrt_status_ = "idle";
-
-  // Backtrack target
+  // Backtrack targetrget
   geometry_msgs::msg::Point backtrack_target_;
   int backtrack_junction_id_ = -1;
 
   // Breadcrumb trail: record drone positions for backtrack routing
   std::vector<geometry_msgs::msg::Point> breadcrumbs_;
-  double breadcrumb_spacing_ = 30.0;  ///< Min distance between breadcrumbs
+  double breadcrumb_spacing_ = 10.0;  ///< Min distance between breadcrumbs (overridden by parameter)
 
   // Multi-hop backtrack waypoint queue (short hops the RRT can actually reach)
   std::vector<geometry_msgs::msg::Point> backtrack_waypoints_;
@@ -251,14 +241,13 @@ private:
   double last_explored_volume_ = 0.0;     ///< Number of known (free+occupied) leaves last check
   rclcpp::Time last_progress_time_;        ///< Last time we saw meaningful exploration progress
   bool progress_time_initialized_ = false;
-  double stagnation_timeout_ = 20.0;       ///< Seconds of no new exploration before triggering backtrack
+  double stagnation_timeout_ = 10.0;       ///< Seconds of no new exploration before triggering backtrack
   double min_volume_delta_ = 5.0;          ///< Minimum new leaves to count as "progress"
 
   // Junction candidate confirmation (temporal filtering)
   struct JunctionCandidate {
     geometry_msgs::msg::Point position;
     int detection_count = 0;
-    rclcpp::Time first_seen;
     rclcpp::Time last_seen;
     std::vector<std::vector<geometry_msgs::msg::Point>> arm_clusters; // saved for creation
     std::vector<Eigen::Vector3d> arm_directions;
@@ -289,7 +278,6 @@ private:
   rclcpp::Subscription<geometry_msgs::msg::PoseArray>::SharedPtr frontier_sub_;
   rclcpp::Subscription<octomap_msgs::msg::Octomap>::SharedPtr octomap_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr odom_sub_;
-  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr rrt_status_sub_;
 
   rclcpp::TimerBase::SharedPtr planning_timer_;
   rclcpp::TimerBase::SharedPtr viz_timer_;
@@ -328,10 +316,6 @@ private:
     }
   }
 
-  void rrt_status_callback(const std_msgs::msg::String::SharedPtr msg) {
-    rrt_status_ = msg->data;
-  }
-
   /**
    * Called every time the local planner publishes frontiers.
    *
@@ -345,17 +329,12 @@ private:
   void frontier_callback(const geometry_msgs::msg::PoseArray::SharedPtr msg) {
     if (msg->poses.empty()) return;
 
-    // Store latest frontiers
-    latest_frontiers_.clear();
-    for (const auto& pose : msg->poses) {
-      latest_frontiers_.push_back(pose.position);
-    }
-
     // Evaluate gain of incoming frontiers against the OctoMap.
     // Only reset the timer if at least one frontier has meaningful gain.
     std::vector<geometry_msgs::msg::Point> high_quality_frontiers;
     if (octree_) {
-      for (const auto& f : latest_frontiers_) {
+      for (const auto& pose : msg->poses) {
+        const auto& f = pose.position;
         float gain = calculate_exploration_gain(f);
         if (gain >= min_frontier_gain_for_timer_) {
           high_quality_frontiers.push_back(f);
@@ -363,16 +342,18 @@ private:
       }
     } else {
       // No OctoMap yet — trust the local planner
-      high_quality_frontiers = latest_frontiers_;
+      for (const auto& pose : msg->poses) {
+        high_quality_frontiers.push_back(pose.position);
+      }
     }
 
     if (!high_quality_frontiers.empty()) {
       last_frontier_time_ = now();
-      RCLCPP_DEBUG(get_logger(), "[GLOBAL] %zu/%zu frontiers above gain threshold — timer reset",
-        high_quality_frontiers.size(), latest_frontiers_.size());
+      RCLCPP_DEBUG(get_logger(), "[GLOBAL] %zu frontiers above gain threshold — timer reset",
+        high_quality_frontiers.size());
     } else {
       RCLCPP_DEBUG(get_logger(), "[GLOBAL] All %zu frontiers below gain threshold — timer NOT reset",
-        latest_frontiers_.size());
+        msg->poses.size());
     }
 
     // While exploring, try to detect junctions using only high-quality frontiers
@@ -610,26 +591,17 @@ private:
    * Detect if current frontiers represent a cave intersection.
    *
    * Algorithm:
-   *   1. Compute direction vectors from drone to each frontier
-   *   2. Cluster directions by angular proximity
-   *   3. If >=2 clusters with angular separation > threshold -> junction
-   *   4. Check we have not already recorded a junction nearby
-   */
-  /**
-   * Detect if current frontiers represent a cave intersection.
-   *
-   * Improvements over naive approach:
-   *   - Only considers frontiers with validated OctoMap gain (pre-filtered by caller)
-   *   - Requires minimum distance from drone (filters out close scatter)
-   *   - Uses TEMPORAL CONFIRMATION: a junction must be detected N times
-   *     at a consistent location before it is registered
-   *   - Stale candidates are cleaned up
+   *   1. Compute direction vectors from drone to each frontier (min dist filtered)
+   *   2. Greedy angular clustering
+   *   3. If >=2 clusters with angular separation > threshold -> junction candidate
+   *   4. Temporal confirmation: must be detected N times before registering
+   *   5. Proximity check against already-confirmed junctions
    */
   void try_detect_junction(const std::vector<geometry_msgs::msg::Point>& frontiers) {
     if (frontiers.size() < 2) return;
 
     // 1. Compute direction vectors, requiring minimum distance from drone
-    const double min_frontier_dist = 8.0;  // Ignore frontiers closer than this
+    const double min_frontier_dist = 12.0;  // Ignore frontiers closer than this
     struct DirFrontier {
       Eigen::Vector3d dir;
       geometry_msgs::msg::Point point;
@@ -751,7 +723,6 @@ private:
       JunctionCandidate cand;
       cand.position = current_position_;
       cand.detection_count = 1;
-      cand.first_seen = now_t;
       cand.last_seen = now_t;
       for (const auto& c : centroids) cand.arm_directions.push_back(c);
       for (const auto& cluster : clusters) {
