@@ -83,10 +83,10 @@ struct Junction {
   Junction() : id(0), last_updated(0, 0, RCL_ROS_TIME) {}
 
   /// Count of arms that still have meaningful exploration potential
-  int unexplored_arm_count() const {
+  int unexplored_arm_count(float gain_threshold = 0.1f) const {
     int count = 0;
     for (const auto& arm : arms) {
-      if (!arm.explored && arm.exploration_gain > 0.15f) {
+      if (!arm.explored && arm.exploration_gain > gain_threshold) {
         count++;
       }
     }
@@ -142,9 +142,9 @@ public:
     declare_parameter("junction_detect_angle_deg", 60.0);
     declare_parameter("junction_proximity_m",      60.0);
     declare_parameter("no_frontier_timeout_sec",   12.0);
-    declare_parameter("min_gain_threshold",         0.15);
+    declare_parameter("min_gain_threshold",         0.1);
     declare_parameter("goal_reached_tolerance_m",   8.0);
-    declare_parameter("exploration_eval_radius_m", 10.0);
+    declare_parameter("exploration_eval_radius_m", 20.0);
     declare_parameter("stagnation_timeout_sec",    20.0);
     declare_parameter("junction_confirm_count",       0);
     declare_parameter("min_frontier_gain_for_timer",  0.3);    
