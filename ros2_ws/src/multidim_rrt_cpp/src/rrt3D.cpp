@@ -616,19 +616,44 @@ private:
     // RRT main loop: expand tree until goal found or node limit/time reached
     while (local_nodes.size() < node_limit && (this->now() - start_time).nanoseconds() / 1e9 < rrt_timeout_)
     {
-      // Step 1: Generate random point in configuration space
-      // Use goal-biased sampling (50% toward goal for straighter paths in free space)
+      // Step 1: Sample a random point using a three-tier strategy:
+      //   - 1 in every 100 samples: place exactly at the goal (guarantees the tree
+      //     can always connect once it's within step_size of the goal)
+      //   - 30%: uniform sample inside a sphere of radius 8m around the goal
+      //     (focuses search near the goal to help punch through the last obstacle gap)
+      //   - 69%: uniform sample inside the axis-aligned bounding box of start->goal
+      //     padded by 20m/10m (broad exploration to find paths around obstacles)
+      const float pad_xy = 20.0f;
+      const float pad_z  = 10.0f;
+      float box_min_x = std::min(start_pos[0], goal_pos[0]) - pad_xy;
+      float box_max_x = std::max(start_pos[0], goal_pos[0]) + pad_xy;
+      float box_min_y = std::min(start_pos[1], goal_pos[1]) - pad_xy;
+      float box_max_y = std::max(start_pos[1], goal_pos[1]) + pad_xy;
+      float box_min_z = std::min(start_pos[2], goal_pos[2]) - pad_z;
+      float box_max_z = std::max(start_pos[2], goal_pos[2]) + pad_z;
+
       float rand_x, rand_y, rand_z;
-      if ((rand() % 100) < 80) {
-        // Bias toward goal
+      int sample_roll = rand() % 100;
+      if (sample_roll == 0) {
+        // Exactly 1% chance: place sample directly at goal
         rand_x = goal_pos[0];
         rand_y = goal_pos[1];
         rand_z = goal_pos[2];
+      } else if (sample_roll <= 30) {
+        // 30%: uniform sample in a sphere of radius 8m around the goal
+        // Use rejection sampling inside the enclosing cube
+        const float goal_radius = 8.0f;
+        do {
+          rand_x = goal_pos[0] + (static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f) * goal_radius;
+          rand_y = goal_pos[1] + (static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f) * goal_radius;
+          rand_z = goal_pos[2] + (static_cast<float>(rand()) / RAND_MAX * 2.0f - 1.0f) * goal_radius;
+        } while (pow(rand_x - goal_pos[0], 2) + pow(rand_y - goal_pos[1], 2) +
+                 pow(rand_z - goal_pos[2], 2) > goal_radius * goal_radius);
       } else {
-        // Random sampling in reasonable bounds
-        rand_x = start_pos[0] + (rand() % 200 - 100);
-        rand_y = start_pos[1] + (rand() % 200 - 100);
-        rand_z = start_pos[2] + (rand() % 40 - 20);
+        // 69%: uniform sample in the bounding box around start->goal corridor
+        rand_x = box_min_x + static_cast<float>(rand()) / RAND_MAX * (box_max_x - box_min_x);
+        rand_y = box_min_y + static_cast<float>(rand()) / RAND_MAX * (box_max_y - box_min_y);
+        rand_z = box_min_z + static_cast<float>(rand()) / RAND_MAX * (box_max_z - box_min_z);
       }
       
       float min_distance = INFINITY;
