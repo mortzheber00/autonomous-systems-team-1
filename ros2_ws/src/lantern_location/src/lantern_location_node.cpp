@@ -48,7 +48,7 @@ public:
     depth_scale_ = this->get_parameter("depth_scale").as_double();
 
     // Processing frame skip parameter
-    this->declare_parameter("frame_skip", 2);  // Process every 2nd frame by default
+    this->declare_parameter("frame_skip", 1);  // Process every 2nd frame by default
     frame_skip_ = this->get_parameter("frame_skip").as_int();
 
     // Lantern matching distance threshold 
@@ -60,7 +60,7 @@ public:
     lantern_timeout_ = this->get_parameter("lantern_timeout").as_double();
 
     // Minimum updates before lantern is confirmed
-    this->declare_parameter("min_updates_to_confirm", 3);
+    this->declare_parameter("min_updates_to_confirm", 1);
     min_updates_to_confirm_ = this->get_parameter("min_updates_to_confirm").as_int();
 
     // Subscribe to depth camera info to get intrinsics
