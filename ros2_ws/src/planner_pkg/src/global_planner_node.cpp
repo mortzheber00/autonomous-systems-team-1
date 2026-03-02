@@ -144,7 +144,7 @@ public:
     declare_parameter("goal_reached_tolerance_m",   8.0);
     declare_parameter("exploration_eval_radius_m", 50.0);
     declare_parameter("stagnation_timeout_sec",    20.0);
-    declare_parameter("junction_confirm_count",       1);
+    declare_parameter("junction_confirm_count",       3);
     declare_parameter("min_frontier_gain_for_timer",  0.3);    
     declare_parameter("candidate_merge_radius_m",    30.0);
     declare_parameter("breadcrumb_spacing_m",        10.0);

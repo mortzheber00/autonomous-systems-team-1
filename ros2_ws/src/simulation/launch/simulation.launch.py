@@ -62,7 +62,7 @@ def generate_launch_description():
         executable="Simulation.x86_64",
         name="Simulation",
         output="screen",
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
     )
 
     state_estimate_corruptor = Node(
@@ -71,7 +71,7 @@ def generate_launch_description():
         name="state_estimate_corruptor",
         output="screen",
         parameters=[
-            {'use_sim_time': True},
+            {'use_sim_time': False},
             # drift_rw_factor
             {"drift_rw_factor": 0.03},
             # pos_white_sig
@@ -89,7 +89,7 @@ def generate_launch_description():
         name="state_estimate_corruptor",
         output="screen",
         parameters=[
-            {'use_sim_time': True},
+            {'use_sim_time': False},
             {"drift_rw_factor": 0.0},
             {"pos_white_sig": 0.0},
             {"jump_seconds": -1.0},
@@ -102,7 +102,7 @@ def generate_launch_description():
         executable="w_to_unity",
         name="w_to_unity",
         output="screen",
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
     )
 
     unity_state = Node(
@@ -110,7 +110,7 @@ def generate_launch_description():
         executable="unity_state",
         name="unity_state2",
         output="screen",
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
     )
 
     controller_node = Node(
@@ -118,7 +118,7 @@ def generate_launch_description():
         executable="controller_node",
         name="controller_node",
         output="screen",
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
     )
 
     lantern_location_node = Node(
@@ -126,7 +126,7 @@ def generate_launch_description():
         executable="lantern_location_node",
         name="lantern_location_node",
         output="screen",
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
     )
 
     rviz_node = Node(
@@ -134,7 +134,7 @@ def generate_launch_description():
         executable="rviz2",
         name="rviz2",
         output="screen",
-        parameters=[{"use_sim_time": True}],
+        parameters=[{"use_sim_time": False}],
         arguments=["-d", rviz_config_path],
     )
 
@@ -152,7 +152,7 @@ def generate_launch_description():
             name="sim_true_body",
             arguments=["0", "0", "0", "0", "0", "0", "Quadrotor/TrueState", "true_body"],
             output="screen",
-            parameters=[{'use_sim_time': True}],
+            parameters=[{'use_sim_time': False}],
         ),
         Node(
             package="tf2_ros",
@@ -160,7 +160,7 @@ def generate_launch_description():
             name="sim_rgb_camera",
             arguments=["0", "-0.05", "0", "0", "0", "0", "camera", "Quadrotor/RGBCameraLeft"],
             output="screen",
-            parameters=[{'use_sim_time': True}],
+            parameters=[{'use_sim_time': False}],
         ),
         Node(
             package="tf2_ros",
@@ -168,7 +168,7 @@ def generate_launch_description():
             name="sim_depth_camera",
             arguments=["0", "0", "0", "0", "0", "0", "depth_camera", "Quadrotor/Sensors/DepthCamera"],
             output="screen",
-            parameters=[{'use_sim_time': True}],
+            parameters=[{'use_sim_time': False}],
         ),
         Node(
             package="tf2_ros",
@@ -176,7 +176,7 @@ def generate_launch_description():
             name="sim_right_camera",
             arguments=["0", "0.05", "0", "0", "0", "0", "camera", "Quadrotor/RGBCameraRight"],
             output="screen",
-            parameters=[{'use_sim_time': True}],
+            parameters=[{'use_sim_time': False}],
         ),
         Node(
             package="tf2_ros",
@@ -184,7 +184,7 @@ def generate_launch_description():
             name="camera_to_body",
             arguments=["0", "0", "0", "-1.57079632679", "0", "-1.57079632679", "true_body", "camera"],
             output="screen",
-            parameters=[{'use_sim_time': True}],
+            parameters=[{'use_sim_time': False}],
         ),
         Node(
             package="tf2_ros",
@@ -192,7 +192,7 @@ def generate_launch_description():
             name="depth_camera_to_body",
             arguments=["0", "0", "0", "-1.57079632679", "0", "-1.57079632679", "true_body", "depth_camera"],
             output="screen",
-            parameters=[{'use_sim_time': True}],
+            parameters=[{'use_sim_time': False}],
         ),
     ]
 

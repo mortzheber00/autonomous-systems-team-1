@@ -12,7 +12,7 @@ def generate_launch_description():
         executable='point_cloud_xyz_node',
         name='point_cloud_xyz_node',
         output='screen',
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
         # Remap input topics to your camera's topics
         remappings=[
             ('image_rect', 'realsense/depth/image'), # Input Depth
@@ -28,13 +28,16 @@ def generate_launch_description():
         name='octomap_server',
         output='screen',
         parameters=[{
-            'use_sim_time': True,               # Use simulation time
+            'use_sim_time': False,              # Must match rest of system (no /clock published)
             'resolution': 2.0,                 # Voxel size (meters)
             'frame_id': 'world',                # Fixed frame (map/world)
             'base_frame_id': 'true_body',       # Robot base frame
-            'sensor_model.max_range': 60.0,      # Max range to update map
+            'sensor_model.max_range': 60.0,     # Reduced from 60m — large range + 2m voxels amplifies TF timing errors
+            'sensor_model.hit': 0.8,            # Require stronger evidence to mark occupied (default 0.7)
+            'sensor_model.miss': 0.3,           # Faster free-space clearing to recover from transient phantom voxels
             'filter_ground': False,             # Filter out floor plane?
-            'latch:': False                       
+            'filter_speckles': True,            # Remove isolated voxels (phantom artifacts from TF hiccups)
+            'latch': False                       
         }],
         remappings=[
             ('cloud_in', 'realsense/depth/points') # Subscribe to the pointcloud

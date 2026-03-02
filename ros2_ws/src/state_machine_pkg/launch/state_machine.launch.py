@@ -54,7 +54,7 @@ def generate_launch_description():
         executable="controller_node",
         name="controller_node",
         output="screen",
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
         ros_arguments=["--log-level", "WARN"],
     )
 
@@ -63,7 +63,7 @@ def generate_launch_description():
         executable="lantern_location_node",
         name="lantern_location_node",
         output="screen",
-        parameters=[{'use_sim_time': True}],
+        parameters=[{'use_sim_time': False}],
         ros_arguments=["--log-level", "WARN"],
     )
 

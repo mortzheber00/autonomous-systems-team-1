@@ -200,6 +200,7 @@ class StateMachineNode(Node):
             self._transition_to(MissionState.LAND)
 
     def on_timer(self):
+        self._publish_mission_state()
         if not self.have_odom:
             self._dbg_counter = getattr(self, '_dbg_counter', 0) + 1
             if self._dbg_counter % (int(self.command_rate_hz) * 3) == 1:
