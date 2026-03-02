@@ -140,13 +140,13 @@ public:
     declare_parameter("home_y",    0.0);
     declare_parameter("home_z",   16.0);
     declare_parameter("junction_detect_angle_deg", 60.0);
-    declare_parameter("junction_proximity_m",      60.0);
+    declare_parameter("junction_proximity_m",      20.0);
     declare_parameter("no_frontier_timeout_sec",   12.0);
     declare_parameter("min_gain_threshold",         0.1);
     declare_parameter("goal_reached_tolerance_m",   8.0);
-    declare_parameter("exploration_eval_radius_m", 20.0);
+    declare_parameter("exploration_eval_radius_m", 50.0);
     declare_parameter("stagnation_timeout_sec",    20.0);
-    declare_parameter("junction_confirm_count",       0);
+    declare_parameter("junction_confirm_count",       1);
     declare_parameter("min_frontier_gain_for_timer",  0.3);    
     declare_parameter("candidate_merge_radius_m",    30.0);
     declare_parameter("breadcrumb_spacing_m",        30.0);
@@ -154,6 +154,7 @@ public:
     declare_parameter("planning_loop_hz",              2.0);
     declare_parameter("idle_timeout_sec",             15.0);
     declare_parameter("idle_movement_radius_m",        2.0);
+    declare_parameter("junction_max_vertical_z",       0.5);  // |z| above this = vertical arm, ignored
     home_position_.x = get_parameter("home_x").as_double();
     home_position_.y = get_parameter("home_y").as_double();
     home_position_.z = get_parameter("home_z").as_double();
@@ -172,6 +173,7 @@ public:
     planning_loop_hz_            = std::max(0.1, get_parameter("planning_loop_hz").as_double());
     idle_timeout_sec_            = get_parameter("idle_timeout_sec").as_double();
     idle_movement_radius_        = get_parameter("idle_movement_radius_m").as_double();
+    junction_max_vertical_z_     = get_parameter("junction_max_vertical_z").as_double();
 
     // ---- Publishers ----
     global_goal_pub_    = create_publisher<geometry_msgs::msg::PoseArray>("/global_goal", 10);
@@ -263,7 +265,9 @@ private:
 
   // Junction candidate confirmation (temporal filtering)
   struct JunctionCandidate {
-    geometry_msgs::msg::Point position;
+    geometry_msgs::msg::Point position;       ///< First-seen position (merge anchor)
+    geometry_msgs::msg::Point position_sum;   ///< Running sum for averaging across detections
+    int position_count = 0;                   ///< Number of detections included in sum
     int detection_count = 0;
     rclcpp::Time first_seen;
     rclcpp::Time last_seen;
@@ -290,6 +294,7 @@ private:
   double planning_loop_hz_ = 2.0;        ///< Frequency of planning loop updates
   double idle_timeout_sec_ = 15.0;       ///< Seconds of no motion before forcing return home
   double idle_movement_radius_ = 2.0;    ///< Distance that counts as motion progress
+  double junction_max_vertical_z_; ///< Cluster arms with |z| > this are considered vertical (top/bottom of cave) and skipped
   geometry_msgs::msg::Point last_movement_position_{};
   rclcpp::Time last_movement_time_;
   bool movement_tracking_initialized_ = false;
@@ -730,6 +735,27 @@ private:
       centroids.push_back(centroid);
     }
 
+    // 3b. Filter out vertical arms (pointing toward ceiling/floor of the cave).
+    //     Junctions are only left/right (horizontal) — arms whose centroid
+    //     direction has |z| > junction_max_vertical_z_ are discarded.
+    {
+      std::vector<Eigen::Vector3d> h_centroids;
+      std::vector<std::vector<DirFrontier>> h_clusters;
+      for (size_t i = 0; i < centroids.size(); ++i) {
+        if (std::abs(centroids[i].z()) <= junction_max_vertical_z_) {
+          h_centroids.push_back(centroids[i]);
+          h_clusters.push_back(clusters[i]);
+        } else {
+          RCLCPP_DEBUG(get_logger(),
+            "[JUNCTION] Dropping vertical arm dir=(%.2f,%.2f,%.2f) — top/bottom of cave",
+            centroids[i].x(), centroids[i].y(), centroids[i].z());
+        }
+      }
+      if (h_centroids.size() < 2) return;  // Not enough horizontal arms left
+      centroids = std::move(h_centroids);
+      clusters  = std::move(h_clusters);
+    }
+
     bool has_wide_spread = false;
     for (size_t i = 0; i < centroids.size() && !has_wide_spread; ++i) {
       for (size_t j = i + 1; j < centroids.size(); ++j) {
@@ -775,6 +801,11 @@ private:
     if (match) {
       match->detection_count++;
       match->last_seen = now_t;
+      // Accumulate position for averaging
+      match->position_sum.x += current_position_.x;
+      match->position_sum.y += current_position_.y;
+      match->position_sum.z += current_position_.z;
+      match->position_count++;
       // Update arm directions with latest data
       match->arm_directions.clear();
       for (const auto& c : centroids) match->arm_directions.push_back(c);
@@ -798,6 +829,8 @@ private:
       // Create new candidate
       JunctionCandidate cand;
       cand.position = current_position_;
+      cand.position_sum = current_position_;
+      cand.position_count = 1;
       cand.detection_count = 1;
       cand.first_seen = now_t;
       cand.last_seen = now_t;
@@ -824,14 +857,38 @@ private:
     // 6. Confirmed — create the junction from the candidate
     Junction jct;
     jct.id = junction_counter_++;
-    jct.position = match->position;
+    // Use the averaged drone position across all confirmations as the junction center.
+    // This is more robust than anchoring to the first detection, which may have
+    // occurred while the drone was still approaching the junction.
+    {
+      double n = static_cast<double>(match->position_count);
+      jct.position.x = match->position_sum.x / n;
+      jct.position.y = match->position_sum.y / n;
+      jct.position.z = match->position_sum.z / n;
+    }
     jct.last_updated = now_t;
     jct.creation_breadcrumb_idx = breadcrumbs_.size();  // only future breadcrumbs count
 
     for (size_t ci = 0; ci < match->arm_clusters.size(); ++ci) {
       JunctionArm arm;
       arm.direction = (ci < match->arm_directions.size()) ? match->arm_directions[ci] : Eigen::Vector3d::UnitX();
-      arm.target = match->arm_clusters[ci].front();
+
+      // Use the centroid of the cluster's frontier points as the raw target.
+      // Frontier points sit at the free/occupied boundary (wall edge), so we
+      // immediately pull the target away from walls toward the junction center.
+      geometry_msgs::msg::Point raw_target;
+      const auto& cluster_pts = match->arm_clusters[ci];
+      for (const auto& p : cluster_pts) {
+        raw_target.x += p.x;
+        raw_target.y += p.y;
+        raw_target.z += p.z;
+      }
+      double n = static_cast<double>(cluster_pts.size());
+      raw_target.x /= n;
+      raw_target.y /= n;
+      raw_target.z /= n;
+
+      arm.target = adjust_for_wall_clearance(raw_target, jct.position, wall_clearance_);
       arm.exploration_gain = 1.0f;
       arm.explored = false;
       jct.arms.push_back(arm);

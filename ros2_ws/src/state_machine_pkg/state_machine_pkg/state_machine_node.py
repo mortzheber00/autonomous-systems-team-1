@@ -41,8 +41,6 @@ class StateMachineNode(Node):
         self.declare_parameter("land_z", 1.0)
         self.declare_parameter("goal_tolerance", 2.0)
         self.declare_parameter("command_rate_hz", 2.0)
-        self.declare_parameter("target_lantern_count", 3)
-        self.declare_parameter("explore_timeout_sec", 600.0)
         self.declare_parameter("lantern_output_path", "")
 
         self.auto_start = self.get_parameter("auto_start").get_parameter_value().bool_value
@@ -53,8 +51,6 @@ class StateMachineNode(Node):
         self.land_z = self.get_parameter("land_z").get_parameter_value().double_value
         self.goal_tolerance = self.get_parameter("goal_tolerance").get_parameter_value().double_value
         self.command_rate_hz = self.get_parameter("command_rate_hz").get_parameter_value().double_value
-        self.target_lantern_count = self.get_parameter("target_lantern_count").get_parameter_value().integer_value
-        self.explore_timeout_sec = self.get_parameter("explore_timeout_sec").get_parameter_value().double_value
         self.lantern_output_path = self._resolve_output_path(self.get_parameter("lantern_output_path").get_parameter_value().string_value)
 
         self.state = MissionState.IDLE  # start with IDLE
@@ -265,7 +261,10 @@ class StateMachineNode(Node):
                 self.get_logger().info(f"[DBG-SM] LAND: computed target {self.land_target}")
             if not self.goal_sent:
                 self.get_logger().info(f"[DBG-SM] LAND: sending goal {self.land_target}")
-                self.goal_sent = self._send_goal(self.land_target)
+                self.goal_sent = self._publish_direct_trajectory(
+                    self.land_target,
+                    include_current=True,
+                )
             dist = self._dist_to_target(self.land_target)
             self._dbg_counter = getattr(self, '_dbg_counter', 0) + 1
             if self._dbg_counter % (int(self.command_rate_hz) * 3) == 1:
@@ -338,52 +337,12 @@ class StateMachineNode(Node):
         msg.data = self.state.value
         self.mission_state_pub.publish(msg)
 
-    def _send_goal(self, target, waypoints=None) -> bool:
-        """Send a goal (with optional intermediate waypoints) to the basic waypoint planner.
-
-        The ``goal_path`` message is a ``nav_msgs/Path``.  The last pose is
-        the goal position; all preceding poses are intermediate waypoints.
-
-        Returns True if at least one subscriber received the message.
-        """
-        if self.goal_path_pub.get_subscription_count() == 0:
-            self.get_logger().warn(
-                f"[DBG-SM] No subscribers on /goal_path yet – will retry")
-            return False
-        path = Path()
-        path.header.stamp = self.get_clock().now().to_msg()
-        path.header.frame_id = "world"
-
-        if waypoints:
-            for wp in waypoints:
-                ps = PoseStamped()
-                ps.header = path.header
-                ps.pose.position.x = float(wp[0])
-                ps.pose.position.y = float(wp[1])
-                ps.pose.position.z = float(wp[2])
-                path.poses.append(ps)
-
-        goal_pose = PoseStamped()
-        goal_pose.header = path.header
-        goal_pose.pose.position.x = float(target[0])
-        goal_pose.pose.position.y = float(target[1])
-        goal_pose.pose.position.z = float(target[2])
-        path.poses.append(goal_pose)
-
-        self.goal_path_pub.publish(path)
-        subs = self.goal_path_pub.get_subscription_count()
-        self.get_logger().info(
-            f"[DBG-SM] Published /goal_path: {len(path.poses)} pose(s), "
-            f"goal=({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f}), "
-            f"frame={path.header.frame_id}, "
-            f"subs={subs}")
-        return subs > 0
 
     def _publish_direct_trajectory(self, target, waypoints=None, include_current=False) -> bool:
         """Publish a MultiDOF trajectory directly to the controller."""
         if self.controller_traj_pub.get_subscription_count() == 0:
             self.get_logger().warn(
-                "[DBG-SM] No subscribers on /command/trajectory yet – will retry")
+                "[DBG-SM] No subscribers on /command/trajectory yet will retry")
             return False
 
         points: List[List[float]] = []
