@@ -66,7 +66,7 @@ cd ros2_ws
 ```
 
 
-### Simulation
+### Simulation only
 
 First, open a new terminal, source the workspace, and launch the simulation:
 
@@ -78,7 +78,7 @@ ros2 launch simulation simulation.launch.py
 
 The RViz visualization opens automatically. 
 
-### State Machine
+### State Machine only
 
 Wait until the simulation is fully loaded (approx. 10 seconds). In a second terminal, launch the state machine to start the mission:
 
@@ -99,3 +99,30 @@ Additionally, they are published as MarkerArrays on topic `/lantern_location/det
 
 ### Map
 The map is published as topic `/occupied_cells_vis_array`.
+
+## Recording
+
+A mcap recording of the whole cave exploration is provided in the `recording.zip` file. To view the recording `git lfs` is required to pull the file into the local repository. 
+
+To install `git lfs`, run the following commands:
+
+```
+sudo apt update
+sudo apt install git-lfs
+```
+
+Pull and un-zip the `recording.zip`. To run the recording, open `rviz` in the first terminal:
+
+```bash
+cd ros2_ws
+source install/setup.bash
+rviz2 -d src/simulation/config/visualization.rviz 
+```
+
+In a second terminal run the recording:
+
+```bash
+cd ros2_ws
+source install/setup.bash
+ros2 bag play ../recording/ --clock
+```
