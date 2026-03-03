@@ -21,73 +21,85 @@
 
 
 class ControllerNode : public rclcpp::Node {
-  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  //  PART 1 |  Declare ROS callback handlers
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   //  PART 1 |  Declare ROS callback handlers
+ 
+   // Subscribers
+   rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr desired_state_subscriber_;
+   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr current_state_subscriber_;
+     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mission_state_subscriber_;
+ 
+   // Publisher (propeller speeds)
+   rclcpp::Publisher<mav_msgs::msg::Actuators>::SharedPtr rotor_speed_publisher_;
+ 
+   // Debug visualization publishers
+   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_marker_publisher_;
+ 
+   // Timer for main control loop
+   rclcpp::TimerBase::SharedPtr control_loop_timer_;
+ 
+ 
+   // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+   //                                 end part 1
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+   // Controller parameters
+   double kx, kv, kr, komega; // controller gains - [1] eq (15), (16)
+ 
+   // Physical constants (we will set them below)
+   double m;              // mass of the UAV
+   double g;              // gravity acceleration
+   double d;              // distance from the center of propellers to the c.o.m.
+   double cf,             // Propeller lift coefficient
+          cd;             // Propeller drag coefficient
+   Eigen::Matrix3d J;     // Inertia Matrix
+   Eigen::Vector3d e3;    // [0,0,1]
+   Eigen::MatrixXd F2W;   // Wrench-rotor speeds map
+ 
+   // Controller internals (you will have to set them below)
+   // Current state
+   Eigen::Vector3d x;     // current position of the UAV's c.o.m. in the world frame
+   Eigen::Vector3d v;     // current velocity of the UAV's c.o.m. in the world frame
+   Eigen::Matrix3d R;     // current orientation of the UAV
+   Eigen::Vector3d omega; // current angular velocity of the UAV's c.o.m. in the *body* frame
+ 
+   // Desired state
+   Eigen::Vector3d xd;    // desired position of the UAV's c.o.m. in the world frame
+   Eigen::Vector3d vd;    // desired velocity of the UAV's c.o.m. in the world frame
+   Eigen::Vector3d ad;    // desired acceleration of the UAV's c.o.m. in the world frame
+   double yawd;           // desired yaw angle
+   
+   // Storage for the full trajectory path (Carrot Following)
+   std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> path_points_;
+   bool has_trajectory_ = false;  // true once first trajectory is received
+ 
+   // Debug state (updated by updateDesiredStateFromCarrot, published in controlLoop)
+   double debug_lookahead_ = 0.0;
+   double debug_desired_speed_ = 0.0;
+   double debug_dist_to_end_ = 0.0;
+   double debug_cross_track_ = 0.0;
+   Eigen::Vector3d debug_path_tangent_ = Eigen::Vector3d::Zero();
+   int debug_publish_counter_ = 0;
 
-  // Subscribers
-  rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr desired_state_subscriber_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr current_state_subscriber_;
-    rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mission_state_subscriber_;
+   // Mission-state driven behavior switches
+   std::string mission_state_ = "idle";
+   bool cross_track_enabled_ = true;
+   const double nominal_speed_cap_mps_ = 2.0;
+   const double takeoff_speed_cap_mps_ = 15.0;
+   const double go_to_entrance_wp_radius_ = 10.0;
+   double speed_cap_mps_ = 2.0;
 
-  // Publisher (propeller speeds)
-  rclcpp::Publisher<mav_msgs::msg::Actuators>::SharedPtr rotor_speed_publisher_;
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   //  Velocity Selection | Choose between:
+   // SLOW: 5 m/s (for precise trajectory following)
+   // REGULAR: 8 m/s (for regular trajectory following)
+   // FAST: 15 m/s (fast maneuvering - may miss junctions or lanterns)
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-  // Debug visualization publishers
-  rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_marker_publisher_;
+   const double MAX_VELOCITY = 8.0; // m/s
 
-  // Timer for main control loop
-  rclcpp::TimerBase::SharedPtr control_loop_timer_;
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-
-  // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-  //                                 end part 1
-  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-  // Controller parameters
-  double kx, kv, kr, komega; // controller gains - [1] eq (15), (16)
-
-  // Physical constants (we will set them below)
-  double m;              // mass of the UAV
-  double g;              // gravity acceleration
-  double d;              // distance from the center of propellers to the c.o.m.
-  double cf,             // Propeller lift coefficient
-         cd;             // Propeller drag coefficient
-  Eigen::Matrix3d J;     // Inertia Matrix
-  Eigen::Vector3d e3;    // [0,0,1]
-  Eigen::MatrixXd F2W;   // Wrench-rotor speeds map
-
-  // Controller internals (you will have to set them below)
-  // Current state
-  Eigen::Vector3d x;     // current position of the UAV's c.o.m. in the world frame
-  Eigen::Vector3d v;     // current velocity of the UAV's c.o.m. in the world frame
-  Eigen::Matrix3d R;     // current orientation of the UAV
-  Eigen::Vector3d omega; // current angular velocity of the UAV's c.o.m. in the *body* frame
-
-  // Desired state
-  Eigen::Vector3d xd;    // desired position of the UAV's c.o.m. in the world frame
-  Eigen::Vector3d vd;    // desired velocity of the UAV's c.o.m. in the world frame
-  Eigen::Vector3d ad;    // desired acceleration of the UAV's c.o.m. in the world frame
-  double yawd;           // desired yaw angle
-  
-  // Storage for the full trajectory path (Carrot Following)
-  std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> path_points_;
-  bool has_trajectory_ = false;  // true once first trajectory is received
-
-  // Debug state (updated by updateDesiredStateFromCarrot, published in controlLoop)
-  double debug_lookahead_ = 0.0;
-  double debug_desired_speed_ = 0.0;
-  double debug_dist_to_end_ = 0.0;
-  double debug_cross_track_ = 0.0;
-  Eigen::Vector3d debug_path_tangent_ = Eigen::Vector3d::Zero();
-  int debug_publish_counter_ = 0;
-
-    // Mission-state driven behavior switches
-    std::string mission_state_ = "idle";
-    bool cross_track_enabled_ = true;
-    const double nominal_speed_cap_mps_ = 2.0;
-    const double takeoff_speed_cap_mps_ = 15.0;
-    const double go_to_entrance_wp_radius_ = 10.0;
-    double speed_cap_mps_ = 2.0;
 
   double hz;             // frequency of the main control loop
 
@@ -449,7 +461,7 @@ public:
     // Limit Max Velocity (by saturation of position error)
     // Limits the maximum "pull" towards the goal
     // Steady state velocity v = -(kx/kv) * ex
-    double max_velocity = 10.0; // m/s
+    double max_velocity = MAX_VELOCITY;
     double max_ex = max_velocity * kv / kx;
     if (ex.norm() > max_ex) {
         ex = ex.normalized() * max_ex;

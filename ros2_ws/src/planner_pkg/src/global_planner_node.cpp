@@ -152,7 +152,7 @@ public:
     declare_parameter("breadcrumb_spacing_m",        30.0);
     declare_parameter("wall_clearance_m",             3.0);
     declare_parameter("planning_loop_hz",              2.0);
-    declare_parameter("idle_timeout_sec",             15.0);
+    declare_parameter("idle_timeout_sec",             120.0);
     declare_parameter("idle_movement_radius_m",        2.0);
     declare_parameter("junction_max_vertical_z",       0.5);  // |z| above this = vertical arm, ignored
     home_position_.x = get_parameter("home_x").as_double();
@@ -292,7 +292,7 @@ private:
   double candidate_merge_radius_;       ///< Radius for merging junction candidate detections
   double wall_clearance_;                ///< Min distance a backtrack target must be from walls
   double planning_loop_hz_ = 2.0;        ///< Frequency of planning loop updates
-  double idle_timeout_sec_ = 15.0;       ///< Seconds of no motion before forcing return home
+  double idle_timeout_sec_ = 120.0;       ///< Seconds of no motion before forcing return home
   double idle_movement_radius_ = 2.0;    ///< Distance that counts as motion progress
   double junction_max_vertical_z_; ///< Cluster arms with |z| > this are considered vertical (top/bottom of cave) and skipped
   geometry_msgs::msg::Point last_movement_position_{};
