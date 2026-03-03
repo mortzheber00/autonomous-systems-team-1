@@ -1,19 +1,15 @@
 state_machine_node:
   ros__parameters:
     auto_start: true
-    takeoff_alt: 10.0
+    takeoff_alt: 25.0
     entry_goal: [-340.0, 9.0, 16.0]
     entry_waypoints: [
-      -100.0, 9.0, 20.0, 
-      -280.0, 9.0, 20.0, 
+      -100.0, 9.0, 24.0,
+      -200.0, 9.0, 20.0,
+      -280.0, 9.0, 18.0,  
     ]
     land_goal: []
-    land_z: 1.0
+    land_z: 4.0
     goal_tolerance: 3.0
     command_rate_hz: 2.0
     lantern_output_path: "./lantern_positions.json"
-
-planner:
-  ros__parameters:
-    max_velocity: 20.0
-    max_acceleration: 5.0

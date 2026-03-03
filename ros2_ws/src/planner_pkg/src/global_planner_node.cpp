@@ -76,14 +76,17 @@ struct Junction {
   std::vector<JunctionArm> arms;                   ///< Diverging exploration directions
   rclcpp::Time last_updated;                       ///< Timestamp of last gain re-evaluation
   bool fully_explored = false;                     ///< True when all arms are explored or low-gain
+  size_t creation_breadcrumb_idx = 0;              ///< Breadcrumb index when junction was created;
+                                                   ///  only breadcrumbs AFTER this index are used
+                                                   ///  for arm-explored detection
 
   Junction() : id(0), last_updated(0, 0, RCL_ROS_TIME) {}
 
   /// Count of arms that still have meaningful exploration potential
-  int unexplored_arm_count() const {
+  int unexplored_arm_count(float gain_threshold = 0.1f) const {
     int count = 0;
     for (const auto& arm : arms) {
-      if (!arm.explored && arm.exploration_gain > 0.15f) {
+      if (!arm.explored && arm.exploration_gain > gain_threshold) {
         count++;
       }
     }
@@ -137,17 +140,21 @@ public:
     declare_parameter("home_y",    0.0);
     declare_parameter("home_z",   16.0);
     declare_parameter("junction_detect_angle_deg", 60.0);
-    declare_parameter("junction_proximity_m",      60.0);
+    declare_parameter("junction_proximity_m",      35.0);
     declare_parameter("no_frontier_timeout_sec",   12.0);
-    declare_parameter("min_gain_threshold",         0.15);
+    declare_parameter("min_gain_threshold",         0.1);
     declare_parameter("goal_reached_tolerance_m",   8.0);
-    declare_parameter("exploration_eval_radius_m", 10.0);
+    declare_parameter("exploration_eval_radius_m", 20.0);
     declare_parameter("stagnation_timeout_sec",    20.0);
-    declare_parameter("junction_confirm_count",       0);
+    declare_parameter("junction_confirm_count",       1);
     declare_parameter("min_frontier_gain_for_timer",  0.3);    
     declare_parameter("candidate_merge_radius_m",    30.0);
     declare_parameter("breadcrumb_spacing_m",        30.0);
     declare_parameter("wall_clearance_m",             3.0);
+    declare_parameter("planning_loop_hz",              2.0);
+    declare_parameter("idle_timeout_sec",             120.0);
+    declare_parameter("idle_movement_radius_m",        2.0);
+    declare_parameter("junction_max_vertical_z",       0.5);
     home_position_.x = get_parameter("home_x").as_double();
     home_position_.y = get_parameter("home_y").as_double();
     home_position_.z = get_parameter("home_z").as_double();
@@ -163,6 +170,10 @@ public:
     candidate_merge_radius_      = get_parameter("candidate_merge_radius_m").as_double();
     breadcrumb_spacing_          = get_parameter("breadcrumb_spacing_m").as_double();
     wall_clearance_              = get_parameter("wall_clearance_m").as_double();
+    planning_loop_hz_            = std::max(0.1, get_parameter("planning_loop_hz").as_double());
+    idle_timeout_sec_            = get_parameter("idle_timeout_sec").as_double();
+    idle_movement_radius_        = get_parameter("idle_movement_radius_m").as_double();
+    junction_max_vertical_z_     = get_parameter("junction_max_vertical_z").as_double();
 
     // ---- Publishers ----
     global_goal_pub_    = create_publisher<geometry_msgs::msg::PoseArray>("/global_goal", 10);
@@ -193,8 +204,9 @@ public:
     );
 
     // ---- Timers ----
+    const auto planning_period = std::chrono::duration<double>(1.0 / planning_loop_hz_);
     planning_timer_ = create_wall_timer(
-      std::chrono::milliseconds(1000),
+      planning_period,
       std::bind(&GlobalPlannerNode::planning_loop, this));
 
     viz_timer_ = create_wall_timer(
@@ -205,9 +217,9 @@ public:
 
     RCLCPP_INFO(get_logger(),
       "Global Planner initialized. Home=(%.0f, %.0f, %.0f), "
-      "junction_angle=%.0f deg, timeout=%.0fs",
+      "junction_angle=%.0f deg, timeout=%.0fs, planning_loop=%.1f Hz",
       home_position_.x, home_position_.y, home_position_.z,
-      junction_angle_threshold_ * 180.0 / M_PI, no_frontier_timeout_);
+      junction_angle_threshold_ * 180.0 / M_PI, no_frontier_timeout_, planning_loop_hz_);
   }
 
 private:
@@ -253,7 +265,9 @@ private:
 
   // Junction candidate confirmation (temporal filtering)
   struct JunctionCandidate {
-    geometry_msgs::msg::Point position;
+    geometry_msgs::msg::Point position;       ///< First-seen position (merge anchor)
+    geometry_msgs::msg::Point position_sum;   ///< Running sum for averaging across detections
+    int position_count = 0;                   ///< Number of detections included in sum
     int detection_count = 0;
     rclcpp::Time first_seen;
     rclcpp::Time last_seen;
@@ -277,6 +291,13 @@ private:
   double min_frontier_gain_for_timer_;  ///< Only frontiers with gain above this reset the timer
   double candidate_merge_radius_;       ///< Radius for merging junction candidate detections
   double wall_clearance_;                ///< Min distance a backtrack target must be from walls
+  double planning_loop_hz_ = 2.0;        ///< Frequency of planning loop updates
+  double idle_timeout_sec_ = 120.0;       ///< Seconds of no motion before forcing return home
+  double idle_movement_radius_ = 2.0;    ///< Distance that counts as motion progress
+  double junction_max_vertical_z_; ///< Cluster arms with |z| > this are considered vertical (top/bottom of cave) and skipped
+  geometry_msgs::msg::Point last_movement_position_{};
+  rclcpp::Time last_movement_time_;
+  bool movement_tracking_initialized_ = false;
 
   // ---- ROS handles ----
   rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr global_goal_pub_;
@@ -304,12 +325,22 @@ private:
     current_position_ = msg->pose.pose.position;
     odom_received_ = true;
 
-    // Record breadcrumbs for backtrack routing
-    if (state_ == ExplorationState::EXPLORING) {
-      if (breadcrumbs_.empty() ||
-          point_distance(current_position_, breadcrumbs_.back()) >= breadcrumb_spacing_) {
-        breadcrumbs_.push_back(current_position_);
-      }
+    const auto now_t = now();
+    if (!movement_tracking_initialized_) {
+      last_movement_position_ = current_position_;
+      last_movement_time_ = now_t;
+      movement_tracking_initialized_ = true;
+    } else if (point_distance(current_position_, last_movement_position_) >= idle_movement_radius_) {
+      last_movement_position_ = current_position_;
+      last_movement_time_ = now_t;
+    }
+
+    // Record breadcrumbs for backtrack routing and arm-explored detection.
+    // Recorded in ALL states so that backtracking flights also leave a trail
+    // (needed to mark junction arms the drone passes through during backtrack).
+    if (breadcrumbs_.empty() ||
+        point_distance(current_position_, breadcrumbs_.back()) >= breadcrumb_spacing_) {
+      breadcrumbs_.push_back(current_position_);
     }
   }
 
@@ -409,6 +440,8 @@ private:
         break;
     }
 
+    check_idle_timeout();
+
     // Periodically re-evaluate junction gains
     re_evaluate_junction_gains();
   }
@@ -486,15 +519,7 @@ private:
         }
       } else {
         // No junctions left -> go home via breadcrumb route
-        backtrack_waypoints_ = build_backtrack_route(home_position_);
-        backtrack_waypoints_.push_back(home_position_);
-        backtrack_wp_idx_ = 0;
-        state_ = ExplorationState::RETURNING_HOME;
-        RCLCPP_WARN(get_logger(),
-          "[GLOBAL] -> RETURNING_HOME via %zu waypoints", backtrack_waypoints_.size());
-        if (!backtrack_waypoints_.empty()) {
-          publish_global_goal(backtrack_waypoints_[0]);
-        }
+        initiate_return_home("no junctions remaining");
       }
     }
   }
@@ -504,6 +529,10 @@ private:
    * Each hop is short enough for the RRT to handle.
    */
   void handle_backtracking() {
+    // Also mark arms during backtracking — the drone may fly through or
+    // past other junctions on its way to the target junction.
+    mark_explored_arms();
+
     if (backtrack_waypoints_.empty() || backtrack_wp_idx_ >= backtrack_waypoints_.size()) {
       // Shouldn't happen, but recover gracefully
       RCLCPP_WARN(get_logger(), "[GLOBAL] Backtrack waypoints exhausted -> EXPLORING");
@@ -595,6 +624,37 @@ private:
     }
   }
 
+  void initiate_return_home(const std::string& reason) {
+    backtrack_waypoints_ = build_backtrack_route(home_position_);
+    backtrack_waypoints_.push_back(home_position_);
+    backtrack_wp_idx_ = 0;
+    state_ = ExplorationState::RETURNING_HOME;
+    RCLCPP_WARN(get_logger(),
+      "[GLOBAL] -> RETURNING_HOME (%s) via %zu waypoints",
+      reason.c_str(), backtrack_waypoints_.size());
+
+    if (!backtrack_waypoints_.empty()) {
+      publish_global_goal(backtrack_waypoints_[0]);
+    } else {
+      publish_global_goal(home_position_);
+    }
+  }
+
+  void check_idle_timeout() {
+    if (!global_planner_enabled_) return;
+    if (state_ == ExplorationState::RETURNING_HOME || state_ == ExplorationState::DONE) return;
+    if (!movement_tracking_initialized_) return;
+
+    double idle_elapsed = (now() - last_movement_time_).seconds();
+    if (idle_elapsed > idle_timeout_sec_) {
+      RCLCPP_WARN(get_logger(),
+        "[GLOBAL] No motion > %.1fs within %.1fm — forcing return home",
+        idle_elapsed, idle_movement_radius_);
+      initiate_return_home("motion timeout");
+      progress_time_initialized_ = false;
+    }
+  }
+
   // ==========================================================================
   // Junction Detection
   // ==========================================================================
@@ -675,6 +735,27 @@ private:
       centroids.push_back(centroid);
     }
 
+    // 3b. Filter out vertical arms (pointing toward ceiling/floor of the cave).
+    //     Junctions are only left/right (horizontal) — arms whose centroid
+    //     direction has |z| > junction_max_vertical_z_ are discarded.
+    {
+      std::vector<Eigen::Vector3d> h_centroids;
+      std::vector<std::vector<DirFrontier>> h_clusters;
+      for (size_t i = 0; i < centroids.size(); ++i) {
+        if (std::abs(centroids[i].z()) <= junction_max_vertical_z_) {
+          h_centroids.push_back(centroids[i]);
+          h_clusters.push_back(clusters[i]);
+        } else {
+          RCLCPP_DEBUG(get_logger(),
+            "[JUNCTION] Dropping vertical arm dir=(%.2f,%.2f,%.2f) — top/bottom of cave",
+            centroids[i].x(), centroids[i].y(), centroids[i].z());
+        }
+      }
+      if (h_centroids.size() < 2) return;  // Not enough horizontal arms left
+      centroids = std::move(h_centroids);
+      clusters  = std::move(h_clusters);
+    }
+
     bool has_wide_spread = false;
     for (size_t i = 0; i < centroids.size() && !has_wide_spread; ++i) {
       for (size_t j = i + 1; j < centroids.size(); ++j) {
@@ -720,6 +801,11 @@ private:
     if (match) {
       match->detection_count++;
       match->last_seen = now_t;
+      // Accumulate position for averaging
+      match->position_sum.x += current_position_.x;
+      match->position_sum.y += current_position_.y;
+      match->position_sum.z += current_position_.z;
+      match->position_count++;
       // Update arm directions with latest data
       match->arm_directions.clear();
       for (const auto& c : centroids) match->arm_directions.push_back(c);
@@ -743,6 +829,8 @@ private:
       // Create new candidate
       JunctionCandidate cand;
       cand.position = current_position_;
+      cand.position_sum = current_position_;
+      cand.position_count = 1;
       cand.detection_count = 1;
       cand.first_seen = now_t;
       cand.last_seen = now_t;
@@ -769,13 +857,38 @@ private:
     // 6. Confirmed — create the junction from the candidate
     Junction jct;
     jct.id = junction_counter_++;
-    jct.position = match->position;
+    // Use the averaged drone position across all confirmations as the junction center.
+    // This is more robust than anchoring to the first detection, which may have
+    // occurred while the drone was still approaching the junction.
+    {
+      double n = static_cast<double>(match->position_count);
+      jct.position.x = match->position_sum.x / n;
+      jct.position.y = match->position_sum.y / n;
+      jct.position.z = match->position_sum.z / n;
+    }
     jct.last_updated = now_t;
+    jct.creation_breadcrumb_idx = breadcrumbs_.size();  // only future breadcrumbs count
 
     for (size_t ci = 0; ci < match->arm_clusters.size(); ++ci) {
       JunctionArm arm;
       arm.direction = (ci < match->arm_directions.size()) ? match->arm_directions[ci] : Eigen::Vector3d::UnitX();
-      arm.target = match->arm_clusters[ci].front();
+
+      // Use the centroid of the cluster's frontier points as the raw target.
+      // Frontier points sit at the free/occupied boundary (wall edge), so we
+      // immediately pull the target away from walls toward the junction center.
+      geometry_msgs::msg::Point raw_target;
+      const auto& cluster_pts = match->arm_clusters[ci];
+      for (const auto& p : cluster_pts) {
+        raw_target.x += p.x;
+        raw_target.y += p.y;
+        raw_target.z += p.z;
+      }
+      double n = static_cast<double>(cluster_pts.size());
+      raw_target.x /= n;
+      raw_target.y /= n;
+      raw_target.z /= n;
+
+      arm.target = adjust_for_wall_clearance(raw_target, jct.position, wall_clearance_);
       arm.exploration_gain = 1.0f;
       arm.explored = false;
       jct.arms.push_back(arm);
@@ -971,22 +1084,92 @@ private:
   }
 
   /**
-   * Mark junction arms as explored when the drone flies close to them.
+   * Mark junction arms as explored when the drone flies close to them
+   * OR has traveled along the arm's direction (detected via breadcrumbs).
+   *
+   * Three checks per arm:
+   *   1. Current position near the arm's original target point (legacy check)
+   *   2. Any breadcrumb lies along the arm's direction from the junction centre
+   *      at a sufficient distance → the drone has flown down that corridor
+   *   3. Current position lies along the arm's direction (catches the case
+   *      where the drone returns to a junction from a loop)
    */
   void mark_explored_arms() {
+    // Cone parameters: a point must be within the angular cone AND within
+    // the distance band [min, max] from the junction centre to count.
+    // Beyond max the cave has likely turned and direction is unreliable.
+    const double arm_angle_threshold = M_PI / 7.0;   //
+    const double min_travel_from_jct = 40.0;          // Too close = still at junction
+    const double max_travel_from_jct = 80.0;          // Too far = direction unreliable
+
     for (auto& jct : junctions_) {
       if (jct.fully_explored) continue;
+
+      Eigen::Vector3d jct_pos(jct.position.x, jct.position.y, jct.position.z);
 
       for (auto& arm : jct.arms) {
         if (arm.explored) continue;
 
-        // Arm is explored if drone passed within tolerance of its target
-        double dist = point_distance(current_position_, arm.target);
-        if (dist < goal_reached_tolerance_) {
+        // --- Check 1: proximity to original target (quick, cheap) ---
+        double dist_to_target = point_distance(current_position_, arm.target);
+        if (dist_to_target < goal_reached_tolerance_) {
           arm.explored = true;
           RCLCPP_INFO(get_logger(),
-            "[JUNCTION] Marked arm of junction %d as explored (target dist=%.1fm)",
-            jct.id, dist);
+            "[JUNCTION] Marked arm of junction %d as explored "
+            "(near target, dist=%.1fm)",
+            jct.id, dist_to_target);
+          continue;
+        }
+
+        // --- Check 2: breadcrumbs in the arm's cone ---
+        //     ONLY breadcrumbs recorded AFTER the junction was created.
+        //     Must be within the distance band [min, max] from junction.
+        for (size_t bi = jct.creation_breadcrumb_idx; bi < breadcrumbs_.size(); ++bi) {
+          Eigen::Vector3d crumb_pos(breadcrumbs_[bi].x, breadcrumbs_[bi].y, breadcrumbs_[bi].z);
+          Eigen::Vector3d to_crumb = crumb_pos - jct_pos;
+          double dist_from_jct = to_crumb.norm();
+
+          // Skip if outside the detection band
+          if (dist_from_jct < min_travel_from_jct || dist_from_jct > max_travel_from_jct)
+            continue;
+
+          to_crumb.normalize();
+          double angle = std::acos(
+            std::clamp(to_crumb.dot(arm.direction), -1.0, 1.0));
+
+          if (angle < arm_angle_threshold) {
+            arm.explored = true;
+            RCLCPP_INFO(get_logger(),
+              "[JUNCTION] Marked arm of junction %d as explored "
+              "(breadcrumb in cone, angle=%.1f°, dist=%.1fm from jct)",
+              jct.id, angle * 180.0 / M_PI, dist_from_jct);
+            break;
+          }
+        }
+        if (arm.explored) continue;
+
+        // --- Check 3: current position in the arm's cone ---
+        //     Only after the drone has moved away since junction creation.
+        if (breadcrumbs_.size() <= jct.creation_breadcrumb_idx) continue;
+
+        Eigen::Vector3d cur_pos(current_position_.x,
+                                current_position_.y,
+                                current_position_.z);
+        Eigen::Vector3d to_cur = cur_pos - jct_pos;
+        double dist_cur = to_cur.norm();
+
+        if (dist_cur >= min_travel_from_jct && dist_cur <= max_travel_from_jct) {
+          to_cur.normalize();
+          double angle = std::acos(
+            std::clamp(to_cur.dot(arm.direction), -1.0, 1.0));
+
+          if (angle < arm_angle_threshold) {
+            arm.explored = true;
+            RCLCPP_INFO(get_logger(),
+              "[JUNCTION] Marked arm of junction %d as explored "
+              "(drone in cone, angle=%.1f°, dist=%.1fm from jct)",
+              jct.id, angle * 180.0 / M_PI, dist_cur);
+          }
         }
       }
 

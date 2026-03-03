@@ -19,25 +19,7 @@ def generate_launch_description():
         name="state_machine_node",
         output="screen",
         parameters=[config_file, {"use_sim_time": False}],
-    )
-
-    waypoint_planner_node = Node(
-        package="basic_waypoint_pkg",
-        executable="basic_waypoint_node",
-        name="planner",
-        output="screen",
-        parameters=[config_file, {"use_sim_time": False}],
-    )
-
-    sampler_node = Node(
-        package="mav_trajectory_generation",
-        executable="trajectory_sampler_node",
-        name="sampler",
-        output="screen",
-        parameters=[{"use_sim_time": False}],
-        remappings=[
-            ("path_segments_4D", "trajectory"),  # Planner publishes to "trajectory"
-        ],
+        ros_arguments=["--log-level", "WARN"],
     )
 
     local_planner_node = Node(
@@ -46,6 +28,7 @@ def generate_launch_description():
         name="local_planner_node",
         output="screen",
         parameters=[{"use_sim_time": False}],
+        ros_arguments=["--log-level", "WARN"],
     )
 
     global_planner_node = Node(
@@ -54,6 +37,7 @@ def generate_launch_description():
         name="global_planner_node",
         output="screen",
         parameters=[{"use_sim_time": False}],
+        ros_arguments=["--log-level", "INFO"],
     )
 
     rrt_node = Node(
@@ -62,6 +46,7 @@ def generate_launch_description():
         name="rrt3D",
         output="screen",
         parameters=[{"use_sim_time": False}],
+        ros_arguments=["--log-level", "WARN"],
     )
 
     controller_node = Node(
@@ -70,6 +55,7 @@ def generate_launch_description():
         name="controller_node",
         output="screen",
         parameters=[{'use_sim_time': True}],
+        ros_arguments=["--log-level", "WARN"],
     )
 
     lantern_location_node = Node(
@@ -78,6 +64,7 @@ def generate_launch_description():
         name="lantern_location_node",
         output="screen",
         parameters=[{'use_sim_time': True}],
+        ros_arguments=["--log-level", "WARN"],
     )
 
     mapping_launch = IncludeLaunchDescription(
@@ -95,6 +82,4 @@ def generate_launch_description():
         local_planner_node,
         global_planner_node,
         rrt_node,
-        waypoint_planner_node,
-        sampler_node,
     ])

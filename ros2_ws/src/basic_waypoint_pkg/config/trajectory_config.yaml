@@ -1,4 +1,0 @@
-planner:
-  ros__parameters:
-    max_velocity: 10.0
-    max_acceleration: 3.0

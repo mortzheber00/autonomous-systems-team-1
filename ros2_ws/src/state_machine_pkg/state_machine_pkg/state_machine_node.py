@@ -11,12 +11,13 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from rclpy.exceptions import ParameterUninitializedException
 
-from geometry_msgs.msg import PoseStamped, Quaternion
+from geometry_msgs.msg import PoseStamped, Quaternion, Transform
 from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import MarkerArray
 
 from ament_index_python.packages import get_package_share_directory
+from trajectory_msgs.msg import MultiDOFJointTrajectory, MultiDOFJointTrajectoryPoint
 
 
 class MissionState(Enum):
@@ -40,8 +41,6 @@ class StateMachineNode(Node):
         self.declare_parameter("land_z", 1.0)
         self.declare_parameter("goal_tolerance", 2.0)
         self.declare_parameter("command_rate_hz", 2.0)
-        self.declare_parameter("target_lantern_count", 3)
-        self.declare_parameter("explore_timeout_sec", 600.0)
         self.declare_parameter("lantern_output_path", "")
 
         self.auto_start = self.get_parameter("auto_start").get_parameter_value().bool_value
@@ -52,8 +51,6 @@ class StateMachineNode(Node):
         self.land_z = self.get_parameter("land_z").get_parameter_value().double_value
         self.goal_tolerance = self.get_parameter("goal_tolerance").get_parameter_value().double_value
         self.command_rate_hz = self.get_parameter("command_rate_hz").get_parameter_value().double_value
-        self.target_lantern_count = self.get_parameter("target_lantern_count").get_parameter_value().integer_value
-        self.explore_timeout_sec = self.get_parameter("explore_timeout_sec").get_parameter_value().double_value
         self.lantern_output_path = self._resolve_output_path(self.get_parameter("lantern_output_path").get_parameter_value().string_value)
 
         self.state = MissionState.IDLE  # start with IDLE
@@ -78,6 +75,11 @@ class StateMachineNode(Node):
             "/goal_path",
             10,
         )
+        self.controller_traj_pub = self.create_publisher(
+            MultiDOFJointTrajectory,
+            "/command/trajectory",
+            10,
+        )
 
         enable_qos = QoSProfile(depth=1)
         enable_qos.durability = QoSDurabilityPolicy.TRANSIENT_LOCAL
@@ -95,6 +97,11 @@ class StateMachineNode(Node):
             Bool,
             "/state_machine/enable_global_planner",
             enable_qos,
+        )
+        self.mission_state_pub = self.create_publisher(
+            String,
+            "/state_machine/mission_state",
+            10,
         )
 
         self.odom_sub = self.create_subscription(
@@ -129,6 +136,7 @@ class StateMachineNode(Node):
         self._publish_enable_local_planner(False)
         self._publish_enable_rrt(False)
         self._publish_enable_global_planner(False)
+        self._publish_mission_state()
 
     def _get_vec_param(self, name: str, optional: bool = False):
         try:
@@ -192,7 +200,12 @@ class StateMachineNode(Node):
             self._transition_to(MissionState.LAND)
 
     def on_timer(self):
+        self._publish_mission_state()  # Publish mission state for late subscribing controller
+
         if not self.have_odom:
+            self._dbg_counter = getattr(self, '_dbg_counter', 0) + 1
+            if self._dbg_counter % (int(self.command_rate_hz) * 3) == 1:
+                self.get_logger().warn(f"[DBG-SM] Waiting for odometry... (no odom yet)")
             return
 
         if self.state == MissionState.IDLE:
@@ -207,16 +220,35 @@ class StateMachineNode(Node):
                     self.current_pose.y,
                     self.takeoff_alt,
                 ]
-                self._send_goal(self.takeoff_target)
-                self.goal_sent = True
+                self.get_logger().info(f"[DBG-SM] TAKEOFF: sending goal {self.takeoff_target}")
+                self.goal_sent = self._publish_direct_trajectory(
+                    self.takeoff_target,
+                    include_current=True,
+                )
+            dist = self._dist_to_target(self.takeoff_target)
+            self._dbg_counter = getattr(self, '_dbg_counter', 0) + 1
+            if self._dbg_counter % (int(self.command_rate_hz) * 3) == 1:
+                self.get_logger().info(
+                    f"[DBG-SM] TAKEOFF: pos=({self.current_pose.x:.1f},{self.current_pose.y:.1f},{self.current_pose.z:.1f}) "
+                    f"target={self.takeoff_target} dist={dist:.2f} tol={self.goal_tolerance}")
             if self._is_at_target(self.takeoff_target):
                 self._transition_to(MissionState.GO_TO_ENTRANCE)
             return
 
         if self.state == MissionState.GO_TO_ENTRANCE:
             if not self.goal_sent:
-                self._send_goal(self.entry_goal, waypoints=self.entry_waypoints)
-                self.goal_sent = True
+                self.get_logger().info(f"[DBG-SM] GO_TO_ENTRANCE: sending goal {self.entry_goal} with {len(self.entry_waypoints)} waypoints")
+                self.goal_sent = self._publish_direct_trajectory(
+                    self.entry_goal,
+                    waypoints=self.entry_waypoints,
+                    include_current=True,
+                )
+            dist = self._dist_to_target(self.entry_goal)
+            self._dbg_counter = getattr(self, '_dbg_counter', 0) + 1
+            if self._dbg_counter % (int(self.command_rate_hz) * 3) == 1:
+                self.get_logger().info(
+                    f"[DBG-SM] GO_TO_ENTRANCE: pos=({self.current_pose.x:.1f},{self.current_pose.y:.1f},{self.current_pose.z:.1f}) "
+                    f"target={self.entry_goal} dist={dist:.2f} tol={self.goal_tolerance}")
             if self._is_at_target(self.entry_goal):
                 self._transition_to(MissionState.EXPLORE)
             return
@@ -228,9 +260,19 @@ class StateMachineNode(Node):
         if self.state == MissionState.LAND:
             if self.land_target is None:
                 self.land_target = self._compute_land_target()
+                self.get_logger().info(f"[DBG-SM] LAND: computed target {self.land_target}")
             if not self.goal_sent:
-                self._send_goal(self.land_target)
-                self.goal_sent = True
+                self.get_logger().info(f"[DBG-SM] LAND: sending goal {self.land_target}")
+                self.goal_sent = self._publish_direct_trajectory(
+                    self.land_target,
+                    include_current=True,
+                )
+            dist = self._dist_to_target(self.land_target)
+            self._dbg_counter = getattr(self, '_dbg_counter', 0) + 1
+            if self._dbg_counter % (int(self.command_rate_hz) * 3) == 1:
+                self.get_logger().info(
+                    f"[DBG-SM] LAND: pos=({self.current_pose.x:.1f},{self.current_pose.y:.1f},{self.current_pose.z:.1f}) "
+                    f"target={self.land_target} dist={dist:.2f}")
             if self._is_at_target(self.land_target):
                 self._transition_to(MissionState.DONE)
             return
@@ -247,6 +289,7 @@ class StateMachineNode(Node):
         self.get_logger().info(f"[state-machine] Transition: {self.state.value} -> {new_state.value}")
         self.state = new_state
         self.goal_sent = False
+        self._publish_mission_state()
 
         if new_state == MissionState.EXPLORE:
             self.explore_start_time = self.get_clock().now()
@@ -277,48 +320,60 @@ class StateMachineNode(Node):
         msg = Bool()
         msg.data = enabled
         self.enable_local_planner_pub.publish(msg)
+        self.get_logger().info(f"[DBG-SM] enable_local_planner = {enabled}")
 
     def _publish_enable_rrt(self, enabled: bool):
         msg = Bool()
         msg.data = enabled
         self.enable_rrt_pub.publish(msg)
+        self.get_logger().info(f"[DBG-SM] enable_rrt = {enabled}")
 
     def _publish_enable_global_planner(self, enabled: bool):
         msg = Bool()
         msg.data = enabled
         self.enable_global_planner_pub.publish(msg)
+        self.get_logger().info(f"[DBG-SM] enable_global_planner = {enabled}")
 
-    def _send_goal(self, target, waypoints=None):
-        """Send a goal (with optional intermediate waypoints) to the basic waypoint planner.
+    def _publish_mission_state(self):
+        msg = String()
+        msg.data = self.state.value
+        self.mission_state_pub.publish(msg)
 
-        The ``goal_path`` message is a ``nav_msgs/Path``.  The last pose is
-        the goal position; all preceding poses are intermediate waypoints.
-        """
-        path = Path()
-        path.header.stamp = self.get_clock().now().to_msg()
-        path.header.frame_id = "world"
 
+    def _publish_direct_trajectory(self, target, waypoints=None, include_current=False) -> bool:
+        """Publish a MultiDOF trajectory directly to the controller."""
+        if self.controller_traj_pub.get_subscription_count() == 0:
+            self.get_logger().warn(
+                "[DBG-SM] No subscribers on /command/trajectory yet will retry")
+            return False
+
+        points: List[List[float]] = []
+        if include_current and self.current_pose is not None:
+            points.append([self.current_pose.x, self.current_pose.y, self.current_pose.z])
         if waypoints:
-            for wp in waypoints:
-                ps = PoseStamped()
-                ps.header = path.header
-                ps.pose.position.x = float(wp[0])
-                ps.pose.position.y = float(wp[1])
-                ps.pose.position.z = float(wp[2])
-                path.poses.append(ps)
+            points.extend([list(wp) for wp in waypoints])
+        points.append(list(target))
 
-        goal_pose = PoseStamped()
-        goal_pose.header = path.header
-        goal_pose.pose.position.x = float(target[0])
-        goal_pose.pose.position.y = float(target[1])
-        goal_pose.pose.position.z = float(target[2])
-        path.poses.append(goal_pose)
+        traj = MultiDOFJointTrajectory()
+        traj.header.stamp = self.get_clock().now().to_msg()
+        traj.header.frame_id = "world"
 
-        self.goal_path_pub.publish(path)
+        for pt in points:
+            traj_point = MultiDOFJointTrajectoryPoint()
+            transform = Transform()
+            transform.translation.x = float(pt[0])
+            transform.translation.y = float(pt[1])
+            transform.translation.z = float(pt[2])
+            transform.rotation.w = 1.0
+            traj_point.transforms.append(transform)
+            traj.points.append(traj_point)
+
+        self.controller_traj_pub.publish(traj)
+        subs = self.controller_traj_pub.get_subscription_count()
         self.get_logger().info(
-            f"Sent goal ({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f}) "
-            f"with {len(path.poses) - 1} waypoint(s) to planner"
-        )
+            f"[DBG-SM] Published direct /command/trajectory: {len(points)} point(s), "
+            f"goal=({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f}), subs={subs}")
+        return subs > 0
 
     def _cancel_planner(self):
         """Send an empty path to stop the planner from republishing."""
@@ -332,11 +387,14 @@ class StateMachineNode(Node):
             return self.land_goal
         return [self.current_pose.x, self.current_pose.y, self.land_z]
 
-    def _is_at_target(self, target):
+    def _dist_to_target(self, target):
         dx = self.current_pose.x - target[0]
         dy = self.current_pose.y - target[1]
         dz = self.current_pose.z - target[2]
-        return math.sqrt(dx * dx + dy * dy + dz * dz) <= self.goal_tolerance
+        return math.sqrt(dx * dx + dy * dy + dz * dz)
+
+    def _is_at_target(self, target):
+        return self._dist_to_target(target) <= self.goal_tolerance
 
     def _save_lantern_positions(self):
         try:
@@ -370,7 +428,10 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        try:
+            rclpy.shutdown()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

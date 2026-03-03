@@ -435,7 +435,7 @@ private:
     
     int num_samples = std::max(2, static_cast<int>(dist / 1.0)); // Sample every 1.0m (less dense)
     
-    for (int i = 0; i <= num_samples; ++i) {
+    for (int i = 2; i <= num_samples; ++i) {
       float t = static_cast<float>(i) / num_samples;
       std::vector<float> sample = {
         from[0] + t * dx,

@@ -10,6 +10,9 @@
 #include <mav_msgs/msg/actuators.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <trajectory_msgs/msg/multi_dof_joint_trajectory.hpp>
+#include <visualization_msgs/msg/marker.hpp>
+#include <visualization_msgs/msg/marker_array.hpp>
+#include <std_msgs/msg/string.hpp>
 
 #include <Eigen/Dense>
 #include <tf2/utils.h>
@@ -18,52 +21,85 @@
 
 
 class ControllerNode : public rclcpp::Node {
-  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  //  PART 1 |  Declare ROS callback handlers
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   //  PART 1 |  Declare ROS callback handlers
+ 
+   // Subscribers
+   rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr desired_state_subscriber_;
+   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr current_state_subscriber_;
+     rclcpp::Subscription<std_msgs::msg::String>::SharedPtr mission_state_subscriber_;
+ 
+   // Publisher (propeller speeds)
+   rclcpp::Publisher<mav_msgs::msg::Actuators>::SharedPtr rotor_speed_publisher_;
+ 
+   // Debug visualization publishers
+   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr debug_marker_publisher_;
+ 
+   // Timer for main control loop
+   rclcpp::TimerBase::SharedPtr control_loop_timer_;
+ 
+ 
+   // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
+   //                                 end part 1
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+ 
+   // Controller parameters
+   double kx, kv, kr, komega; // controller gains - [1] eq (15), (16)
+ 
+   // Physical constants (we will set them below)
+   double m;              // mass of the UAV
+   double g;              // gravity acceleration
+   double d;              // distance from the center of propellers to the c.o.m.
+   double cf,             // Propeller lift coefficient
+          cd;             // Propeller drag coefficient
+   Eigen::Matrix3d J;     // Inertia Matrix
+   Eigen::Vector3d e3;    // [0,0,1]
+   Eigen::MatrixXd F2W;   // Wrench-rotor speeds map
+ 
+   // Controller internals (you will have to set them below)
+   // Current state
+   Eigen::Vector3d x;     // current position of the UAV's c.o.m. in the world frame
+   Eigen::Vector3d v;     // current velocity of the UAV's c.o.m. in the world frame
+   Eigen::Matrix3d R;     // current orientation of the UAV
+   Eigen::Vector3d omega; // current angular velocity of the UAV's c.o.m. in the *body* frame
+ 
+   // Desired state
+   Eigen::Vector3d xd;    // desired position of the UAV's c.o.m. in the world frame
+   Eigen::Vector3d vd;    // desired velocity of the UAV's c.o.m. in the world frame
+   Eigen::Vector3d ad;    // desired acceleration of the UAV's c.o.m. in the world frame
+   double yawd;           // desired yaw angle
+   
+   // Storage for the full trajectory path (Carrot Following)
+   std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> path_points_;
+   bool has_trajectory_ = false;  // true once first trajectory is received
+ 
+   // Debug state (updated by updateDesiredStateFromCarrot, published in controlLoop)
+   double debug_lookahead_ = 0.0;
+   double debug_desired_speed_ = 0.0;
+   double debug_dist_to_end_ = 0.0;
+   double debug_cross_track_ = 0.0;
+   Eigen::Vector3d debug_path_tangent_ = Eigen::Vector3d::Zero();
+   int debug_publish_counter_ = 0;
 
-  // Subscribers
-  rclcpp::Subscription<trajectory_msgs::msg::MultiDOFJointTrajectory>::SharedPtr desired_state_subscriber_;
-  rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr current_state_subscriber_;
+   // Mission-state driven behavior switches
+   std::string mission_state_ = "idle";
+   bool cross_track_enabled_ = true;
+   const double nominal_speed_cap_mps_ = 2.0;
+   const double takeoff_speed_cap_mps_ = 15.0;
+   const double go_to_entrance_wp_radius_ = 10.0;
+   double speed_cap_mps_ = 2.0;
 
-  // Publisher (propeller speeds)
-  rclcpp::Publisher<mav_msgs::msg::Actuators>::SharedPtr rotor_speed_publisher_;
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+   //  Velocity Selection | Choose between:
+   // SLOW: 5 m/s (for precise trajectory following)
+   // REGULAR: 8 m/s (for regular trajectory following)
+   // FAST: 15 m/s (fast maneuvering - may miss junctions or lanterns)
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-  // Timer for main control loop
-  rclcpp::TimerBase::SharedPtr control_loop_timer_;
+   const double MAX_VELOCITY = 8.0; // m/s
 
+   // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-  // ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~ ~
-  //                                 end part 1
-  // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-  // Controller parameters
-  double kx, kv, kr, komega; // controller gains - [1] eq (15), (16)
-
-  // Physical constants (we will set them below)
-  double m;              // mass of the UAV
-  double g;              // gravity acceleration
-  double d;              // distance from the center of propellers to the c.o.m.
-  double cf,             // Propeller lift coefficient
-         cd;             // Propeller drag coefficient
-  Eigen::Matrix3d J;     // Inertia Matrix
-  Eigen::Vector3d e3;    // [0,0,1]
-  Eigen::MatrixXd F2W;   // Wrench-rotor speeds map
-
-  // Controller internals (you will have to set them below)
-  // Current state
-  Eigen::Vector3d x;     // current position of the UAV's c.o.m. in the world frame
-  Eigen::Vector3d v;     // current velocity of the UAV's c.o.m. in the world frame
-  Eigen::Matrix3d R;     // current orientation of the UAV
-  Eigen::Vector3d omega; // current angular velocity of the UAV's c.o.m. in the *body* frame
-
-  // Desired state
-  Eigen::Vector3d xd;    // desired position of the UAV's c.o.m. in the world frame
-  Eigen::Vector3d vd;    // desired velocity of the UAV's c.o.m. in the world frame
-  Eigen::Vector3d ad;    // desired acceleration of the UAV's c.o.m. in the world frame
-  double yawd;           // desired yaw angle
-  
-  // Storage for the full trajectory path (Carrot Following)
-  std::vector<trajectory_msgs::msg::MultiDOFJointTrajectoryPoint> path_points_;
 
   double hz;             // frequency of the main control loop
 
@@ -87,7 +123,7 @@ public:
     xd(-38,10,9),
     vd(0,0,0),
     ad(0,0,0),
-    yawd(0)
+    yawd(3.14159265)
   {
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     //  PART 2 |  Initialize ROS callback handlers
@@ -103,9 +139,17 @@ public:
         "/current_state_est", 10,
         std::bind(&ControllerNode::onCurrentState, this, std::placeholders::_1));
 
+    mission_state_subscriber_ = this->create_subscription<std_msgs::msg::String>(
+        "/state_machine/mission_state", 10,
+        std::bind(&ControllerNode::onMissionState, this, std::placeholders::_1));
+
     // Publisher for Motor Commands
     rotor_speed_publisher_ = this->create_publisher<mav_msgs::msg::Actuators>(
         "/rotor_speed_cmds", 10);
+
+    // Debug visualization publisher
+    debug_marker_publisher_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
+        "/controller_debug", 10);
 
     // bind controllerNode::controlLoop() to the created timer, at frequency
     control_loop_timer_ = this->create_wall_timer(
@@ -121,7 +165,7 @@ public:
     // ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
     // Controller gains 
     kx = 3.0;
-    kv = 3.6;
+    kv = 3.6; 
     kr = 10.0;
     komega = 2.0;
 
@@ -134,6 +178,8 @@ public:
     J << 1.0,0.0,0.0,
          0.0,1.0,0.0,
          0.0,0.0,1.0;
+
+        speed_cap_mps_ = nominal_speed_cap_mps_;
 
     RCLCPP_INFO(this->get_logger(), "controller_node ready (hz=%.1f)", hz);
   }
@@ -151,71 +197,208 @@ public:
 
       // Store the full path for the control loop to process (Carrot Following)
       path_points_ = msg->points;
+      has_trajectory_ = true;
+
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[DBG-TRAJ] Received trajectory: %zu points. First=(%f,%f,%f) Last=(%f,%f,%f)",
+        msg->points.size(),
+        msg->points.front().transforms[0].translation.x,
+        msg->points.front().transforms[0].translation.y,
+        msg->points.front().transforms[0].translation.z,
+        msg->points.back().transforms[0].translation.x,
+        msg->points.back().transforms[0].translation.y,
+        msg->points.back().transforms[0].translation.z);
   }
+
+      void onMissionState(const std_msgs::msg::String::SharedPtr msg){
+        mission_state_ = msg->data;
+        bool high_speed_phase = (mission_state_ == "takeoff" || mission_state_ == "go_to_entrance");
+        cross_track_enabled_ = !high_speed_phase;
+        speed_cap_mps_ = high_speed_phase ? takeoff_speed_cap_mps_ : nominal_speed_cap_mps_;
+
+        RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+          "[DBG-MISSION] state=%s cross_track=%s speed_cap=%.1f",
+          mission_state_.c_str(), cross_track_enabled_ ? "on" : "off", speed_cap_mps_);
+      }
   
+  // Helper: extract position from a trajectory point
+  Eigen::Vector3d pointPosition(const trajectory_msgs::msg::MultiDOFJointTrajectoryPoint& pt) const {
+      return Eigen::Vector3d(
+          pt.transforms[0].translation.x,
+          pt.transforms[0].translation.y,
+          pt.transforms[0].translation.z);
+  }
+
+  // Helper: shortest distance from point p to line segment (a, b)
+  static double pointToSegmentDist(const Eigen::Vector3d& p,
+                                   const Eigen::Vector3d& a,
+                                   const Eigen::Vector3d& b) {
+      Eigen::Vector3d ab = b - a;
+      double len_sq = ab.squaredNorm();
+      if (len_sq < 1e-12) return (p - a).norm();
+      double t = std::clamp((p - a).dot(ab) / len_sq, 0.0, 1.0);
+      return (p - (a + t * ab)).norm();
+  }
+
   void updateDesiredStateFromCarrot() {
       if (path_points_.empty()) return;
 
-      // 1. Find closest point on path to current drone position 'x'
-      double min_dist_sq = std::numeric_limits<double>::max();
-      size_t closest_idx = 0;
-      
-      // Optimization: If path is long, we could search only a window, but full search is safest
-      for (size_t i = 0; i < path_points_.size(); ++i) {
-          const auto& p = path_points_[i];
-          double dx = p.transforms[0].translation.x - x.x();
-          double dy = p.transforms[0].translation.y - x.y();
-          double dz = p.transforms[0].translation.z - x.z();
-          double d_sq = dx*dx + dy*dy + dz*dz;
-           if (d_sq < min_dist_sq) {
-               min_dist_sq = d_sq;
-               closest_idx = i;
-           }
-      }
-
-      // 2. Look ahead 5m (or end of path)
-      size_t target_idx = closest_idx;
-      double lookahead = 5.0; 
-      
-      for (size_t i = closest_idx; i < path_points_.size(); ++i) {
-          const auto& p = path_points_[i];
-          double dx = p.transforms[0].translation.x - x.x();
-          double dy = p.transforms[0].translation.y - x.y();
-          double dz = p.transforms[0].translation.z - x.z();
-          double dist = std::sqrt(dx*dx + dy*dy + dz*dz);
-          
-          target_idx = i;
-          if (dist >= lookahead) {
-              break;
+      if (mission_state_ == "go_to_entrance" && path_points_.size() > 1) {
+          bool popped = false;
+          while (path_points_.size() > 1) {
+              Eigen::Vector3d first = pointPosition(path_points_.front());
+              double dist = (x - first).norm();
+              if (dist <= go_to_entrance_wp_radius_) {
+                  path_points_.erase(path_points_.begin());
+                  popped = true;
+              } else {
+                  break;
+              }
+          }
+          if (popped) {
+              RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 1000,
+                "[DBG-WP] Pruned go_to_entrance waypoint, remaining=%zu", path_points_.size());
           }
       }
-      
-      const auto& target = path_points_[target_idx];
 
-      // 3. Update Desired State
-      if (!target.transforms.empty()) {
-            xd << target.transforms[0].translation.x,
-                    target.transforms[0].translation.y,
-                    target.transforms[0].translation.z;
-            
-            // Extract yaw
-            auto q = target.transforms[0].rotation;
-            double siny_cosp = 2.0 * (q.w * q.z + q.x * q.y);
-            double cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z);
-            yawd = std::atan2(siny_cosp, cosy_cosp);
+      // ── Multi-point trajectory (RRT paths) → Pure Pursuit ──
+      double min_dist_sq = std::numeric_limits<double>::max();
+      size_t closest_idx = 0;
+
+      for (size_t i = 0; i < path_points_.size(); ++i) {
+          Eigen::Vector3d p = pointPosition(path_points_[i]);
+          double d_sq = (p - x).squaredNorm();
+          if (d_sq < min_dist_sq) {
+              min_dist_sq = d_sq;
+              closest_idx = i;
+          }
       }
 
-      if (!target.velocities.empty()) {
-            vd << target.velocities[0].linear.x,
-                    target.velocities[0].linear.y,
-                    target.velocities[0].linear.z;
+      // Prune waypoints we've clearly passed (keep a small margin)
+      if (closest_idx > 1) {
+          path_points_.erase(path_points_.begin(),
+                             path_points_.begin() + static_cast<long>(closest_idx - 1));
+          closest_idx = 1;
       }
 
-      if (!target.accelerations.empty()) {
-            ad << target.accelerations[0].linear.x,
-                    target.accelerations[0].linear.y,
-                    target.accelerations[0].linear.z;
+      // ── 2. Cross-track error: distance to nearest path *segment* ──
+      //    (not just nearest waypoint — waypoints can be 4m+ apart)
+      double cross_track_error = 0.0;
+      if (cross_track_enabled_) {
+          cross_track_error = std::sqrt(min_dist_sq); // fallback
+          for (size_t i = 0; i + 1 < path_points_.size(); ++i) {
+              double d = pointToSegmentDist(x, pointPosition(path_points_[i]),
+                                               pointPosition(path_points_[i + 1]));
+              cross_track_error = std::min(cross_track_error, d);
+          }
       }
+
+      // ── 3. Adaptive lookahead: scale with current speed ──
+      double speed = v.norm();
+      double lookahead_min = 3.0;   // metres
+      double lookahead_max = 10.0;
+      double lookahead = std::clamp(speed * 1.2, lookahead_min, lookahead_max);
+
+      // If significantly off-path, shrink lookahead to pull back onto path
+      if (cross_track_enabled_ && cross_track_error > 3.0) {
+          lookahead = lookahead_min;
+      }
+
+      // ── 4. Walk along path segments from closest point, accumulate
+      //       arc-length until we exceed the lookahead distance.
+      //       Then *interpolate* the exact carrot point. ──
+      Eigen::Vector3d carrot = pointPosition(path_points_.back()); // fallback: end of path
+      Eigen::Vector3d path_tangent = Eigen::Vector3d::Zero();
+      bool interpolated = false;
+
+      double arc = 0.0;
+      for (size_t i = closest_idx; i + 1 < path_points_.size(); ++i) {
+          Eigen::Vector3d seg_start = pointPosition(path_points_[i]);
+          Eigen::Vector3d seg_end   = pointPosition(path_points_[i + 1]);
+          Eigen::Vector3d seg       = seg_end - seg_start;
+          double seg_len = seg.norm();
+
+          if (seg_len < 1e-6) continue;
+
+          if (arc + seg_len >= lookahead) {
+              // Carrot lies on this segment — interpolate
+              double t = (lookahead - arc) / seg_len;
+              carrot = seg_start + t * seg;
+              path_tangent = seg.normalized();
+              interpolated = true;
+              break;
+          }
+          arc += seg_len;
+      }
+
+      // If we reached the end of path without exceeding lookahead,
+      // tangent points from second-to-last → last waypoint
+      if (!interpolated && path_points_.size() >= 2) {
+          Eigen::Vector3d p0 = pointPosition(path_points_[path_points_.size() - 2]);
+          Eigen::Vector3d p1 = pointPosition(path_points_.back());
+          Eigen::Vector3d seg = p1 - p0;
+          path_tangent = (seg.norm() > 1e-6) ? seg.normalized() : Eigen::Vector3d::Zero();
+      }
+
+      // ── 5. Set desired position ──
+      xd = carrot;
+
+      // ── 6. Compute remaining path distance ──
+      double dist_to_end = 0.0;
+      for (size_t i = closest_idx; i + 1 < path_points_.size(); ++i) {
+          dist_to_end += (pointPosition(path_points_[i + 1])
+                        - pointPosition(path_points_[i])).norm();
+      }
+
+      // ── 7. Velocity feedforward along path tangent ──
+      double dist_to_carrot = (carrot - x).norm();
+    double desired_speed = std::min(dist_to_carrot * 1.2, speed_cap_mps_);  // mission-dependent cap
+
+      // Kinematic braking near end of path: v = sqrt(2*a*d), a=4 m/s²
+      double brake_speed = std::sqrt(2.0 * 4.0 * dist_to_end);
+      desired_speed = std::min(desired_speed, brake_speed);
+
+      // Cross-track speed reduction: if drone is far from path, slow down
+      // Uses proper segment distance so this only triggers when truly off-path
+      if (cross_track_enabled_ && cross_track_error > 2.0) {
+          double cross_factor = 2.0 / cross_track_error;  // e.g. 4m off → 50% speed
+          desired_speed *= cross_factor;
+      }
+
+      // If remaining path is very short, just hover (prevents drifting into wall)
+      if (dist_to_end < 2.0) {
+          desired_speed = 0.0;
+      }
+
+      if (path_tangent.norm() > 0.5 && desired_speed > 0.01) {
+          vd = path_tangent * desired_speed;
+      } else {
+          vd.setZero();
+      }
+
+      // No acceleration feedforward from RRT paths
+      ad.setZero();
+
+      // Store debug values for visualization
+      debug_lookahead_ = lookahead;
+      debug_desired_speed_ = desired_speed;
+      debug_dist_to_end_ = dist_to_end;
+      debug_cross_track_ = cross_track_error;
+      debug_path_tangent_ = path_tangent;
+
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+        "[DBG-CARROT] pts=%zu closest=%zu xd=(%f,%f,%f) vd=(%f,%f,%f) "
+        "cross_trk=%.2f lookahead=%.1f dist_end=%.1f des_speed=%.2f tangent=(%f,%f,%f)",
+        path_points_.size(), closest_idx,
+        xd.x(), xd.y(), xd.z(), vd.x(), vd.y(), vd.z(),
+        cross_track_error, lookahead, dist_to_end, desired_speed,
+        path_tangent.x(), path_tangent.y(), path_tangent.z());
+
+      // ── 8. Yaw: face direction of travel (path tangent in xy-plane) ──
+      if (path_tangent.head<2>().norm() > 0.1) {
+          yawd = std::atan2(path_tangent.y(), path_tangent.x());
+      }
+      // else: keep previous yawd (avoid spinning when moving vertically)
   }
 
 
@@ -247,10 +430,23 @@ public:
                       cur_state_msg->twist.twist.angular.y,
                       cur_state_msg->twist.twist.angular.z;
       omega = R.transpose() * omega_world;
+
+      RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 3000,
+        "[DBG-ODOM] pos=(%f,%f,%f) vel=(%f,%f,%f) speed=%.2f",
+        x.x(), x.y(), x.z(), v.x(), v.y(), v.z(), v.norm());
   }
 
   void controlLoop(){
-    updateDesiredStateFromCarrot();
+    // Before first trajectory: hover at current position
+    if (!has_trajectory_) {
+        xd = x;
+        vd.setZero();
+        ad.setZero();
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000,
+          "[DBG-LOOP] No trajectory yet → hovering at (%f,%f,%f)", x.x(), x.y(), x.z());
+    } else {
+        updateDesiredStateFromCarrot();
+    }
 
     Eigen::Vector3d ex, ev, er, eomega;
 
@@ -265,7 +461,7 @@ public:
     // Limit Max Velocity (by saturation of position error)
     // Limits the maximum "pull" towards the goal
     // Steady state velocity v = -(kx/kv) * ex
-    double max_velocity = 10.0; // m/s
+    double max_velocity = MAX_VELOCITY;
     double max_ex = max_velocity * kv / kx;
     if (ex.norm() > max_ex) {
         ex = ex.normalized() * max_ex;
@@ -277,7 +473,7 @@ public:
     Eigen::Vector3d a_fb = (-kx * ex - kv * ev) / m;
 
     // Limit Max Acceleration
-    double max_acceleration = 5.0; // m/s^2
+    double max_acceleration = 15.0; // m/s^2
     if (a_fb.norm() > max_acceleration) {
         a_fb = a_fb.normalized() * max_acceleration;
     }
@@ -352,13 +548,167 @@ public:
     cmd.angular_velocities[3] = w4;
     rotor_speed_publisher_->publish(cmd);
 
-     static int counter = 0;
-     counter++;
+    RCLCPP_INFO_THROTTLE(this->get_logger(), *this->get_clock(), 2000,
+      "[DBG-CTRL] ex=(%.2f,%.2f,%.2f)|%.2f ev=(%.2f,%.2f,%.2f)|%.2f "
+      "f=%.2f rotors=[%.1f,%.1f,%.1f,%.1f] yawd=%.2f",
+      ex.x(), ex.y(), ex.z(), ex.norm(),
+      ev.x(), ev.y(), ev.z(), ev.norm(),
+      f, w1, w2, w3, w4, yawd);
 
-     if (counter % 500 == 0) {  // bei 1000 Hz => etwa alle 0.5s
-         double pos_error = ex.norm();
-         //RCLCPP_INFO(this->get_logger(), "Position error: %.3f m", pos_error);
-     }
+    // Publish debug markers at ~20 Hz (every 50th iteration at 1000 Hz)
+    debug_publish_counter_++;
+    if (debug_publish_counter_ >= 50) {
+        debug_publish_counter_ = 0;
+        publishDebugMarkers(ex, ev);
+    }
+  }
+
+  void publishDebugMarkers(const Eigen::Vector3d& ex, const Eigen::Vector3d& ev) {
+      auto now = this->get_clock()->now();
+      visualization_msgs::msg::MarkerArray markers;
+      int id = 0;
+
+      // ── 1. Carrot point (cyan sphere) ──
+      {
+          visualization_msgs::msg::Marker m;
+          m.header.frame_id = "world";
+          m.header.stamp = now;
+          m.ns = "ctrl_carrot";
+          m.id = id++;
+          m.type = visualization_msgs::msg::Marker::SPHERE;
+          m.action = visualization_msgs::msg::Marker::ADD;
+          m.pose.position.x = xd.x();
+          m.pose.position.y = xd.y();
+          m.pose.position.z = xd.z();
+          m.pose.orientation.w = 1.0;
+          m.scale.x = 0.6; m.scale.y = 0.6; m.scale.z = 0.6;
+          m.color.r = 0.0f; m.color.g = 1.0f; m.color.b = 1.0f; m.color.a = 0.9f;
+          m.lifetime = rclcpp::Duration::from_seconds(0.2);
+          markers.markers.push_back(m);
+      }
+
+      // ── 2. Line from drone to carrot (cyan) ──
+      {
+          visualization_msgs::msg::Marker m;
+          m.header.frame_id = "world";
+          m.header.stamp = now;
+          m.ns = "ctrl_line_to_carrot";
+          m.id = id++;
+          m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+          m.action = visualization_msgs::msg::Marker::ADD;
+          m.pose.orientation.w = 1.0;
+          m.scale.x = 0.08;
+          m.color.r = 0.0f; m.color.g = 0.8f; m.color.b = 1.0f; m.color.a = 0.6f;
+          m.lifetime = rclcpp::Duration::from_seconds(0.2);
+          geometry_msgs::msg::Point p1, p2;
+          p1.x = x.x(); p1.y = x.y(); p1.z = x.z();
+          p2.x = xd.x(); p2.y = xd.y(); p2.z = xd.z();
+          m.points.push_back(p1);
+          m.points.push_back(p2);
+          markers.markers.push_back(m);
+      }
+
+      // ── 3. Current velocity arrow (green) ──
+      {
+          visualization_msgs::msg::Marker m;
+          m.header.frame_id = "world";
+          m.header.stamp = now;
+          m.ns = "ctrl_vel_actual";
+          m.id = id++;
+          m.type = visualization_msgs::msg::Marker::ARROW;
+          m.action = visualization_msgs::msg::Marker::ADD;
+          m.pose.orientation.w = 1.0;
+          m.scale.x = 0.1; m.scale.y = 0.2; m.scale.z = 0.0;
+          m.color.r = 0.2f; m.color.g = 1.0f; m.color.b = 0.2f; m.color.a = 0.9f;
+          m.lifetime = rclcpp::Duration::from_seconds(0.2);
+          geometry_msgs::msg::Point start, end;
+          start.x = x.x(); start.y = x.y(); start.z = x.z();
+          end.x = x.x() + v.x(); end.y = x.y() + v.y(); end.z = x.z() + v.z();
+          m.points.push_back(start);
+          m.points.push_back(end);
+          markers.markers.push_back(m);
+      }
+
+      // ── 4. Desired velocity arrow (yellow) ──
+      {
+          visualization_msgs::msg::Marker m;
+          m.header.frame_id = "world";
+          m.header.stamp = now;
+          m.ns = "ctrl_vel_desired";
+          m.id = id++;
+          m.type = visualization_msgs::msg::Marker::ARROW;
+          m.action = visualization_msgs::msg::Marker::ADD;
+          m.pose.orientation.w = 1.0;
+          m.scale.x = 0.1; m.scale.y = 0.2; m.scale.z = 0.0;
+          m.color.r = 1.0f; m.color.g = 1.0f; m.color.b = 0.0f; m.color.a = 0.9f;
+          m.lifetime = rclcpp::Duration::from_seconds(0.2);
+          geometry_msgs::msg::Point start, end;
+          start.x = x.x(); start.y = x.y(); start.z = x.z();
+          end.x = x.x() + vd.x(); end.y = x.y() + vd.y(); end.z = x.z() + vd.z();
+          m.points.push_back(start);
+          m.points.push_back(end);
+          markers.markers.push_back(m);
+      }
+
+      // ── 5. Text overlay near drone with debug info ──
+      {
+          char buf[320];
+          std::snprintf(buf, sizeof(buf),
+              "v=%.1f / vd=%.1f m/s\n"
+              "pos_err=%.2f m\n"
+              "cross_trk=%.2f m\n"
+              "lookahead=%.1f m\n"
+              "dist_end=%.1f m\n"
+              "pts=%zu",
+              v.norm(), vd.norm(),
+              ex.norm(),
+              debug_cross_track_,
+              debug_lookahead_,
+              debug_dist_to_end_,
+              path_points_.size());
+
+          visualization_msgs::msg::Marker m;
+          m.header.frame_id = "world";
+          m.header.stamp = now;
+          m.ns = "ctrl_text";
+          m.id = id++;
+          m.type = visualization_msgs::msg::Marker::TEXT_VIEW_FACING;
+          m.action = visualization_msgs::msg::Marker::ADD;
+          m.pose.position.x = x.x();
+          m.pose.position.y = x.y();
+          m.pose.position.z = x.z() + 1.5; // above drone
+          m.pose.orientation.w = 1.0;
+          m.scale.z = 0.5; // text height
+          m.color.r = 1.0f; m.color.g = 1.0f; m.color.b = 1.0f; m.color.a = 1.0f;
+          m.text = std::string(buf);
+          m.lifetime = rclcpp::Duration::from_seconds(0.2);
+          markers.markers.push_back(m);
+      }
+
+      // ── 6. Remaining path (thin white line) ──
+      if (path_points_.size() >= 2) {
+          visualization_msgs::msg::Marker m;
+          m.header.frame_id = "world";
+          m.header.stamp = now;
+          m.ns = "ctrl_remaining_path";
+          m.id = id++;
+          m.type = visualization_msgs::msg::Marker::LINE_STRIP;
+          m.action = visualization_msgs::msg::Marker::ADD;
+          m.pose.orientation.w = 1.0;
+          m.scale.x = 0.05;
+          m.color.r = 0.8f; m.color.g = 0.8f; m.color.b = 0.8f; m.color.a = 0.5f;
+          m.lifetime = rclcpp::Duration::from_seconds(0.2);
+          for (const auto& pt : path_points_) {
+              geometry_msgs::msg::Point p;
+              p.x = pt.transforms[0].translation.x;
+              p.y = pt.transforms[0].translation.y;
+              p.z = pt.transforms[0].translation.z;
+              m.points.push_back(p);
+          }
+          markers.markers.push_back(m);
+      }
+
+      debug_marker_publisher_->publish(markers);
   }
 };
 

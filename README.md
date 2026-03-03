@@ -56,6 +56,16 @@ Copy the unpacked simulation files into the folder `ros2_ws/install/simulation/l
 
 ## How to Run
 
+### All in One
+
+We provide a simple bash script to start the Simulation and the State Maschine:
+
+```
+cd ros2_ws
+./launch_all.sh
+```
+
+
 ### Simulation
 
 First, open a new terminal, source the workspace, and launch the simulation:
