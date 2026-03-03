@@ -4,15 +4,15 @@ import json
 import math
 import os
 from enum import Enum
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, QoSDurabilityPolicy
 from rclpy.exceptions import ParameterUninitializedException
 
-from geometry_msgs.msg import PoseStamped, Quaternion, Transform
-from nav_msgs.msg import Odometry, Path
+from geometry_msgs.msg import Transform
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Bool, String
 from visualization_msgs.msg import MarkerArray
 
@@ -54,27 +54,13 @@ class StateMachineNode(Node):
         self.lantern_output_path = self._resolve_output_path(self.get_parameter("lantern_output_path").get_parameter_value().string_value)
 
         self.state = MissionState.IDLE  # start with IDLE
-        self.have_odom = False  # flag to indicate if we've received odometry yet
+        self.have_odom = False  # flag to indicate received odometry
         self.current_pose = None
-        self.current_orientation = None
-        self.current_yaw = 0.0
-
-        # time tracker
-        self.explore_start_time = None
         self.land_target = None
         self.takeoff_target = None
-
-        # prevent re-sending goals every tick
-        self.goal_sent = False
-
+        self.goal_sent = False # prevent re-sending goals every tick
         self.detected_lanterns: Dict[int, Dict[str, float]] = {}
 
-        # Publish goals to the basic waypoint planner
-        self.goal_path_pub = self.create_publisher(
-            Path,
-            "/goal_path",
-            10,
-        )
         self.controller_traj_pub = self.create_publisher(
             MultiDOFJointTrajectory,
             "/command/trajectory",
@@ -130,9 +116,7 @@ class StateMachineNode(Node):
 
         self.get_logger().info("State machine node initialized")
         self.get_logger().info(f"Output path for lanterns: {self.lantern_output_path}")
-        self.get_logger().info(
-            f"Entry waypoints: {len(self.entry_waypoints)} waypoint(s) -> goal {self.entry_goal}"
-        )
+        self.get_logger().info(f"Entry waypoints: {len(self.entry_waypoints)} waypoint(s) -> goal {self.entry_goal}")
         self._publish_enable_local_planner(False)
         self._publish_enable_rrt(False)
         self._publish_enable_global_planner(False)
@@ -175,8 +159,6 @@ class StateMachineNode(Node):
 
     def odom_callback(self, msg: Odometry):
         self.current_pose = msg.pose.pose.position
-        self.current_orientation = msg.pose.pose.orientation
-        self.current_yaw = self._yaw_from_quaternion(self.current_orientation)
         if not self.have_odom:
             self.have_odom = True
             self.get_logger().info("[state-machine] Received first odometry")
@@ -292,9 +274,6 @@ class StateMachineNode(Node):
         self._publish_mission_state()
 
         if new_state == MissionState.EXPLORE:
-            self.explore_start_time = self.get_clock().now()
-            # Stop the waypoint planner so it doesn't conflict with the local planner
-            self._cancel_planner()
             self._publish_enable_local_planner(True)
             self._publish_enable_rrt(True)
             self._global_planner_delay_timer = self.create_timer(
@@ -309,8 +288,11 @@ class StateMachineNode(Node):
         if new_state == MissionState.LAND:
             self._save_lantern_positions()
 
+        if new_state == MissionState.DONE:
+            self.get_logger().warn("[state-machine] State: DONE!")
+
     def _delayed_enable_global_planner(self):
-        """One-shot callback: enable global planner then cancel the timer."""
+        """ enable delayed global planner then cancel the timer """
         if self.state == MissionState.EXPLORE:
             self._publish_enable_global_planner(True)
             self.get_logger().info("[state-machine] Global planner enabled (5 s delay)")
@@ -338,7 +320,6 @@ class StateMachineNode(Node):
         msg = String()
         msg.data = self.state.value
         self.mission_state_pub.publish(msg)
-
 
     def _publish_direct_trajectory(self, target, waypoints=None, include_current=False) -> bool:
         """Publish a MultiDOF trajectory directly to the controller."""
@@ -375,13 +356,6 @@ class StateMachineNode(Node):
             f"goal=({target[0]:.1f}, {target[1]:.1f}, {target[2]:.1f}), subs={subs}")
         return subs > 0
 
-    def _cancel_planner(self):
-        """Send an empty path to stop the planner from republishing."""
-        path = Path()
-        path.header.stamp = self.get_clock().now().to_msg()
-        path.header.frame_id = "world"
-        self.goal_path_pub.publish(path)
-
     def _compute_land_target(self):
         if self.land_goal is not None:
             return self.land_goal
@@ -411,12 +385,6 @@ class StateMachineNode(Node):
                 json.dump(data, f, indent=2)
         except Exception as exc:
             self.get_logger().error(f"Failed to write lantern positions: {exc}")
-
-    @staticmethod
-    def _yaw_from_quaternion(q):
-        siny_cosp = 2.0 * (q.w * q.z + q.x * q.y)
-        cosy_cosp = 1.0 - 2.0 * (q.y * q.y + q.z * q.z)
-        return math.atan2(siny_cosp, cosy_cosp)
 
 
 def main(args=None):
