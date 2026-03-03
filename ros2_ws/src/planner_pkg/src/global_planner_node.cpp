@@ -140,11 +140,11 @@ public:
     declare_parameter("home_y",    0.0);
     declare_parameter("home_z",   16.0);
     declare_parameter("junction_detect_angle_deg", 60.0);
-    declare_parameter("junction_proximity_m",      20.0);
+    declare_parameter("junction_proximity_m",      35.0);
     declare_parameter("no_frontier_timeout_sec",   12.0);
     declare_parameter("min_gain_threshold",         0.1);
     declare_parameter("goal_reached_tolerance_m",   8.0);
-    declare_parameter("exploration_eval_radius_m", 50.0);
+    declare_parameter("exploration_eval_radius_m", 20.0);
     declare_parameter("stagnation_timeout_sec",    20.0);
     declare_parameter("junction_confirm_count",       1);
     declare_parameter("min_frontier_gain_for_timer",  0.3);    
@@ -154,7 +154,7 @@ public:
     declare_parameter("planning_loop_hz",              2.0);
     declare_parameter("idle_timeout_sec",             120.0);
     declare_parameter("idle_movement_radius_m",        2.0);
-    declare_parameter("junction_max_vertical_z",       0.5);  // |z| above this = vertical arm, ignored
+    declare_parameter("junction_max_vertical_z",       0.5);
     home_position_.x = get_parameter("home_x").as_double();
     home_position_.y = get_parameter("home_y").as_double();
     home_position_.z = get_parameter("home_z").as_double();
