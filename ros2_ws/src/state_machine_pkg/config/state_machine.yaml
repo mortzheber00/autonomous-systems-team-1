@@ -9,7 +9,7 @@ state_machine_node:
       -280.0, 9.0, 18.0,  
     ]
     land_goal: []
-    land_z: 1.0
+    land_z: 4.0
     goal_tolerance: 3.0
     command_rate_hz: 2.0
     lantern_output_path: "./lantern_positions.json"
