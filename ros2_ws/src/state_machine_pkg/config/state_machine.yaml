@@ -13,8 +13,3 @@ state_machine_node:
     goal_tolerance: 3.0
     command_rate_hz: 2.0
     lantern_output_path: "./lantern_positions.json"
-
-planner:
-  ros__parameters:
-    max_velocity: 20.0
-    max_acceleration: 5.0
